@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "RabbitControl remote desktop",
+    "description": "Open a RabbitControl controlled device inside DeepSeek Harness. The panel lists devices from rc-server, connects over the LAN or through the rc-server relay, decodes the peer's H.264 screen with WebCodecs, and returns keyboard and mouse input. The entry sits in the left panel list. It needs a reachable rc-server, a sign-in on the RabbitControl server status panel, and a controlled side that is either directly reachable or registered through signalling."
+  }
+}

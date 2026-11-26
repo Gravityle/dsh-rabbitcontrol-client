@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "RabbitControl 远程桌面",
+    "description": "在 DeepSeek Harness 里打开 RabbitControl 被控端的画面：面板从 rc-server 读设备列表，按局域网直连或经 rc-server 中继连接，用 WebCodecs 解 H.264 并把键鼠回传给对端。入口在左侧面板列表。需要 rc-server 可达、在「RabbitControl 服务器状态」面板登录一次，且被控端要么地址可直达、要么已通过信令登记。"
+  }
+}

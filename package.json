@@ -1,0 +1,50 @@
+{
+  "name": "dsh-rabbitcontrol-client",
+  "version": "0.9.1",
+  "type": "module",
+  "description": "RabbitControl remote desktop and controlled side for DeepSeek Harness: sign in to your own rc-server, view or drive another device from the left-sidebar panel, and optionally offer this machine's own screen (macOS) to others.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "bin/*",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  },
+  "license": "MIT",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "dsh-bundle",
+    "rabbitcontrol",
+    "remote-desktop",
+    "webrtc-alternative"
+  ],
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.19.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Gravityle/dsh-rabbitcontrol-client.git"
+  }
+}

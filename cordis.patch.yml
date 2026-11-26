@@ -1,0 +1,17 @@
+# RabbitControl 客户端的插件行。config 原样交给 Host 半边：
+#   bridgePath   rc-bridge 可执行文件路径
+#   clipPath     「回放测试片段」用的 Annex-B H.264 文件
+#   serverUrl    rc-server 的 REST 地址（设备列表从这里读；与「服务器状态」面板同一个部署）
+#   signalDeviceKey 信令路径用的设备 key（被停用后需更换）
+#   insecureTls  接受自签证书；只对本机/内网自签部署打开
+- insert:
+    - id: rabbitcontrol-client
+      name: 'dsh-rabbitcontrol-client'
+      config:
+        bridgePath: ''   # 留空 = 用插件自带的 bin/ 里那个（按平台自动选）
+        clipPath: ''   # 留空：回放模式需要时在面板里指定本机文件
+        serverUrl: ''   # 留空 = 由使用者第一次在面板里填（并写回本 profile）
+        # 本机在 rc-server 上的信令设备 key。注意：设备一旦被管理端停用（DELETE），
+        # 这个 key 就登记不上了，需要在这里换一个新的。
+        signalDeviceKey: 'dsh-rabbitcontrol-viewer'
+        insecureTls: true
