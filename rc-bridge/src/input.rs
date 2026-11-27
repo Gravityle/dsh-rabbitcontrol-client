@@ -188,6 +188,24 @@ mod tests {
     }
 
     #[test]
+    fn preserves_both_shift_sides_and_release_snapshots() {
+        let events = parse_events(br#"{"events":[
+            {"t":"k","sc":42,"p":true,"mod":2},
+            {"t":"k","sc":54,"p":true,"mod":34},
+            {"t":"k","sc":42,"p":false,"mod":32},
+            {"t":"k","sc":30,"p":true,"mod":32},
+            {"t":"k","sc":54,"p":false,"mod":0}
+        ]}"#);
+        assert_eq!(events, vec![
+            InputEvent::Key { scancode: 0x2a, pressed: true, modifiers: 0x02 },
+            InputEvent::Key { scancode: 0x36, pressed: true, modifiers: 0x22 },
+            InputEvent::Key { scancode: 0x2a, pressed: false, modifiers: 0x20 },
+            InputEvent::Key { scancode: 0x1e, pressed: true, modifiers: 0x20 },
+            InputEvent::Key { scancode: 0x36, pressed: false, modifiers: 0 },
+        ]);
+    }
+
+    #[test]
     fn ignores_malformed_json() {
         assert!(parse_events(b"not json").is_empty());
         assert!(parse_events(b"{}").is_empty());

@@ -271,16 +271,22 @@ window.__ModuleLoader__.load({
       '.rcc-btn:focus-visible,.rcc-icon-btn:focus-visible,.rcc-input:focus-visible,.rcc-select:focus-visible,.rcc-advanced>summary:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px}',
       '@media (hover:hover){.rcc-row:not(.rcc-row-self):hover{background:var(--dsw-alias-bg-layer-2)}.rcc-advanced>summary:hover{background:var(--dsw-alias-bg-layer-2)}.rcc-btn:hover:not(:disabled){border-color:var(--dsw-alias-border-l2)}.rcc-icon-btn:hover{border-color:var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary)}.rcc-btn-primary:hover:not(:disabled){filter:brightness(1.06)}.rcc-row:hover{background:var(--dsw-alias-bg-layer-2)}}',
       /* 两栏：左设备列表（管理列表式行）+ 右画面舞台；窄容器自动上下堆叠。 */
-      '.rcc-body{flex:1 1 auto;display:flex;min-height:0}',
-      '.rcc-list-pane{flex:0 0 240px;display:flex;flex-direction:column;min-height:0;border-right:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1)}',
-      '.rcc-pane-head{flex:none;display:flex;align-items:center;gap:8px;padding:10px 12px}',
+      '.rcc-body{flex:1 1 0;display:flex;min-height:0;overflow:hidden}',
+      '.rcc-list-pane{flex:0 0 240px;display:flex;flex-direction:column;box-sizing:border-box;min-width:0;min-height:0;overflow:hidden;border-right:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1)}',
+      '.rcc-pane-head{flex:none;display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;padding:10px 12px 8px}',
       '.rcc-pane-title{font-size:13px;line-height:20px;font-weight:500}',
       '.rcc-count{padding:0 6px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;font-variant-numeric:tabular-nums}',
       '.rcc-spacer{flex:1 1 auto}',
-      '.rcc-rows{flex:1 1 auto;min-height:0;overflow-y:auto;margin:0;padding:0 6px 8px;list-style:none}',
-      '.rcc-row{display:flex;align-items:center;gap:10px;padding:12px;border-radius:6px;cursor:pointer}',
+      '.rcc-list-content{flex:1 1 0;display:flex;flex-direction:column;min-height:0;overflow:hidden}',
+      '.rcc-rows{flex:1 1 0;min-height:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;scrollbar-gutter:stable;margin:0;padding:2px 6px 6px;list-style:none}',
+      '.rcc-row{display:flex;align-items:center;gap:8px;padding:8px 10px;box-sizing:border-box;border-radius:6px;cursor:pointer}',
+      '.rcc-row .rcc-hint{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;overflow-wrap:anywhere}',
+      '.rcc-row .rcc-btn{padding:0 8px}',
+      '.rcc-list-content>.rcc-empty{flex:0 1 auto;min-height:0;max-height:54px;overflow-y:auto;overflow-wrap:anywhere;padding:4px 12px 8px}',
+      '.rcc-list-content>.rcc-list-empty{flex:1 1 0;max-height:none}',
       '.rcc-row[aria-disabled="true"]{cursor:default;opacity:.6}',
       '.rcc-row:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px}',
+      '.rcc-rows:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:-2px}',
       '.rcc-row-go{flex:none;color:var(--dsw-alias-label-secondary);font-size:16px;line-height:1}',
       '.rcc-row-self{cursor:default;background:var(--dsw-alias-bg-layer-2);opacity:.75}',
       '.rcc-row-self .rcc-row-title{font-weight:500;color:var(--dsw-alias-label-secondary)}',
@@ -333,7 +339,7 @@ window.__ModuleLoader__.load({
       '.rcc-label{flex:0 0 84px;font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary)}',
       '.rcc-input,.rcc-select{flex:1 1 auto;min-width:0;box-sizing:border-box;height:28px;padding:0 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px}',
       '@media (pointer:coarse){.rcc-input,.rcc-select{height:34px;font-size:16px}}',
-      '.rcc-pane-title{flex-shrink:0}.rcc-pane-head .rcc-offline-filter{margin-inline-start:auto;gap:4px;font-size:12px;line-height:16px;cursor:pointer}',
+      '.rcc-pane-title{flex-shrink:0}.rcc-pane-head .rcc-offline-filter{flex:0 1 auto;margin-inline-start:auto;gap:4px;min-width:0;font-size:11px;line-height:18px;cursor:pointer}.rcc-offline-filter input{flex:none;margin:0;accent-color:var(--dsw-alias-brand-primary)}.rcc-offline-filter input:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:2px}',
       '.rcc-check{display:flex;align-items:center;gap:8px;font-size:13px;line-height:20px}',
       '.rcc-hint{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}',
       '.rcc-fill .rcc-list-pane,.rcc-fill .rcc-pane-hint{display:none}',
@@ -341,7 +347,7 @@ window.__ModuleLoader__.load({
       '.rcc-fill .rcc-status,.rcc-fill .rcc-message{padding:0 16px}',
       '.rcc-frame:fullscreen{aspect-ratio:auto;width:100%;height:100%;max-height:none;border:0;border-radius:0}',
       // ── 4:3 档位（DSH 窗口常见比例）：左栏横过来放到顶部，画面拿回全部宽度 ──
-      '@container rcc (max-aspect-ratio: 16/10){.rcc-body{flex-direction:column}.rcc-list-pane{flex:0 0 auto;max-height:none;border-right:0;border-bottom:1px solid var(--dsw-alias-border-l1)}.rcc-pane-head{padding:8px 12px 0}.rcc-pane-hint{display:none}.rcc-rows{display:flex;gap:8px;overflow-x:auto;overflow-y:hidden;padding:8px 12px 12px}.rcc-row{flex:0 0 auto;width:196px;padding:8px 10px}.rcc-row-meta{display:none}.rcc-empty{padding:0 12px 12px}}',
+      '@container rcc (max-aspect-ratio: 16/10){.rcc-body{flex-direction:column}.rcc-list-pane{flex:0 0 160px;min-height:0;max-height:160px;border-right:0;border-bottom:1px solid var(--dsw-alias-border-l1)}.rcc-pane-head{padding:8px 12px 4px}.rcc-pane-head .rcc-offline-filter{flex-basis:auto;margin-inline-start:auto}.rcc-pane-hint{display:none}.rcc-rows{display:flex;gap:8px;overflow-x:auto;overflow-y:hidden;scrollbar-gutter:auto;padding:2px 12px 8px}.rcc-row{flex:0 0 220px;min-width:0;max-width:100%;padding:6px 10px}.rcc-row-meta{display:none}.rcc-row .rcc-hint{-webkit-line-clamp:1}.rcc-list-content>.rcc-empty{max-height:32px;padding:2px 12px 6px}.rcc-list-content>.rcc-list-empty{max-height:none}}',
       '@media (max-width:860px){.rcc-stage-pane{padding:10px 12px 12px}.rcc-stage{min-height:min(44vh,320px)}.rcc-standby{padding:24px 16px}}',
     ].join('')
 
@@ -764,6 +770,8 @@ window.__ModuleLoader__.load({
       const sendRef = useRef(true)
       const sessionRef = useRef(false)
       const queueRef = useRef([])
+      // 输入 POST 必须保序：独立请求并发时，松键可能先于按下抵达 Host。
+      const inputPostRef = useRef(Promise.resolve())
       const timerRef = useRef(null)
       const modsRef = useRef(new Set())
       const inputSentRef = useRef(0)
@@ -1084,7 +1092,15 @@ window.__ModuleLoader__.load({
         }
         const batch = queueRef.current
         queueRef.current = []
-        if (batch.length > 0) void postInput(batch)
+        if (batch.length > 0) {
+          const owner = ownerRef.current
+          const send = () => {
+            // 旧会话排队的输入不得进入重连后的新会话。
+            if (ownerRef.current !== owner) return
+            return postInput(batch)
+          }
+          inputPostRef.current = inputPostRef.current.then(send, send)
+        }
       }, [postInput])
 
       /**
@@ -1106,10 +1122,10 @@ window.__ModuleLoader__.load({
         if (mods.size === 0) return
         const events = []
         for (const code of mods) {
+          mods.delete(code)
           const scancode = SCANCODES[code]
-          if (scancode !== undefined) events.push({ t: 'k', sc: scancode, p: false, mod: 0 })
+          if (scancode !== undefined) events.push({ t: 'k', sc: scancode, p: false, mod: modifierBits(mods) })
         }
-        mods.clear()
         if (events.length > 0) pushInput(events)
       }, [pushInput])
 
@@ -1365,6 +1381,7 @@ window.__ModuleLoader__.load({
       // 默认只看在线的：控制端每次走中继都会临时登记一行，会话结束就变离线，
       // 全列出来只会淹没有用信息（想看历史的勾选「显示离线设备」）。
       const visibleDevices = showOffline ? devices : devices.filter((device) => device.online === true)
+      const offlineCount = devices.filter((device) => device.online !== true).length
       const hiddenCount = devices.length - visibleDevices.length
       const deviceRows = visibleDevices.map((device) => {
         const deviceId = String(device.deviceId ?? '')
@@ -1403,12 +1420,12 @@ window.__ModuleLoader__.load({
         },
         h('span', { className: device.online === true ? 'rcc-dot rcc-dot-live' : 'rcc-dot' }),
         h('div', { className: 'rcc-row-main' },
-          h('span', { className: 'rcc-row-title' },
+          h('span', { className: 'rcc-row-title', title: name },
             name,
             isSelf ? h('span', { className: 'rcc-self-chip', key: 'self' }, t('thisMachine')) : null),
           h('span', { className: 'rcc-row-meta', title: meta }, meta),
           !isSelf && !connectable ? h('span', { className: 'rcc-hint' }, status) : null,
-          !isSelf && device.online === false && device.wolCapable && !canWake ? h('span', { className: 'rcc-hint' }, t('wakeUnavailable')) : null),
+          !isSelf && device.online === false && device.wolCapable && !canWake ? h('span', { className: 'rcc-hint', title: t('wakeUnavailable') }, t('wakeUnavailable')) : null),
         canWake ? h('button', { type: 'button', className: 'rcc-btn', 'aria-label': `${t('wake')} ${name}`, disabled: !!wake.pending,
           onClick: () => { void wakeDevice(deviceId, name) },
         }, t(wake.pending === deviceId ? 'wakeSending' : 'wake')) : null,
@@ -1488,19 +1505,22 @@ window.__ModuleLoader__.load({
             setup.note === '' ? null : h('p', { className: 'rcc-message rcc-notice' }, setup.note))))
 
       children.push(session.authorized ? h('div', { className: 'rcc-body', key: 'body' },
-        h('aside', { className: 'rcc-list-pane' },
+        h('aside', { className: 'rcc-list-pane', 'aria-label': t('myDevices') },
           h('div', { className: 'rcc-pane-head' },
             h('span', { className: 'rcc-pane-title' }, t('myDevices')),
             h('span', { className: 'rcc-count' }, String(visibleDevices.length)),
             h('label', { className: 'rcc-check rcc-offline-filter' },
               h('input', { type: 'checkbox', checked: showOffline, onChange: event => setShowOffline(event.target.checked) }),
-              h('span', null, t('showOffline') + (hiddenCount ? ` (${hiddenCount})` : '')))),
+              h('span', null, t('showOffline') + (offlineCount ? ` (${offlineCount})` : '')))),
           h('p', { className: 'rcc-hint rcc-pane-hint' }, t('connectHint')),
-          devices.length === 0
-            ? h('p', { className: 'rcc-empty' }, devicesNote === '' ? t('noDevices') : devicesNote)
-            : h('ul', { className: 'rcc-rows' }, deviceRows),
-          wake.note ? h('p', { className: 'rcc-empty', role: 'status' }, wake.note) : null,
-          devices.length > 0 && devicesNote !== '' ? h('p', { className: 'rcc-empty' }, devicesNote) : null),
+          h('div', { className: 'rcc-list-content' },
+            devices.length === 0
+              ? h('p', { className: 'rcc-empty rcc-list-empty' }, devicesNote === '' ? t('noDevices') : devicesNote)
+              : visibleDevices.length === 0
+                ? h('p', { className: 'rcc-empty rcc-list-empty', role: 'status' }, `${hiddenCount} ${t('offlineHidden')}`)
+                : h('ul', { className: 'rcc-rows', 'aria-label': t('myDevices'), tabIndex: 0 }, deviceRows),
+            wake.note ? h('p', { className: 'rcc-empty', role: 'status' }, wake.note) : null,
+            devices.length > 0 && devicesNote !== '' ? h('p', { className: 'rcc-empty' }, devicesNote) : null)),
         h('section', { className: 'rcc-stage-pane' },
           h('div', { className: 'rcc-stage', key: 'stage' },
             supported && !running
