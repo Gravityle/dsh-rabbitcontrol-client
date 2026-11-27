@@ -1,0 +1,32 @@
+[package]
+name = "rc-client-core"
+version = "0.2.5"
+edition = "2021"
+rust-version = "1.75"
+license = "AGPL-3.0-only"
+description = "RabbitControl 跨平台客户端核心运行时（认证/PKI、信令/P2P/mTLS 中继、主控与被控会话桥接、偏好设置与工具句柄）。"
+
+[dependencies]
+rc-session = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-net = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-input = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-types = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-proto = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-pipeline = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-capture = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-encode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-render = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-decode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-trace = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-audio = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-tools = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rand = "0.8"
+socket2 = { version = "0.6.5", features = ["all"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+base64 = "0.22"
+sha2 = "0.10"
+zeroize = "1"

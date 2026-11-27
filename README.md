@@ -7,14 +7,14 @@
 在 DeepSeek Harness 中把下面这句话发给助手，即可安装固定版本：
 
 ```text
-请用 plugin_manager 的 install_bundle 安装 https://github.com/Gravityle/dsh-rabbitcontrol-client/releases/download/v0.12.3/dsh-rabbitcontrol-client-0.12.3.tgz
+请用 plugin_manager 的 install_bundle 安装 https://github.com/Gravityle/dsh-rabbitcontrol-client/releases/download/v0.13.0/dsh-rabbitcontrol-client-0.13.0.tgz
 ```
 
 安装后打开左侧「远程桌面」，填写自己的 rc-server 地址并登录。包内附带 Apple Silicon Mac 和 Windows x64 边车，这两种平台可将 `bridgePath` 留空。
 
 ### 边车版本与构建
 
-本版随包边车使用 RabbitControl Core `v0.2.3`、macOS 平台库 `v0.2.2` 和 Apple Media `v0.2.1`。个人仓库随版本提供 `rc-bridge/` Rust 源码、锁文件和 AGPL-3.0 许可证。进入该目录后，在 Apple Silicon Mac 上运行 `cargo build --locked --release --features real-capture`，在 Windows x64 上运行 `cargo build --locked --release`。发布构建使用 `--remap-path-prefix` 映射本机路径，macOS 产物另做 ad-hoc 签名。
+本版随包边车使用 RabbitControl Core `v0.2.5`、macOS 平台库 `0.2.4` 源码（固定提交 `65d4c8a53b96a96eecb3c9abb223cf9111abf954`）和 Apple Media `v0.2.3`。构建时 Core `v0.2.5` 的 Release 仍为草稿，macOS `0.2.4` 尚未发布标签；源码和锁文件均固定到明确提交。`rc-bridge/vendor/rc-client-core` 保留该 Core 提交的单个 crate，并用局部补丁公开上游已有的 P2P 端口持有接口，供边车在打洞时协调持久 UDP 探测端口。个人仓库随版本提供 `rc-bridge/` Rust 源码、锁文件和 AGPL-3.0 许可证。进入该目录后，在 Apple Silicon Mac 上运行 `cargo build --locked --release --features real-capture`，在 Windows x64 上运行 `cargo build --locked --release`。发布构建使用 `--remap-path-prefix` 映射本机路径，macOS 产物另做 ad-hoc 签名。
 
 ## 入口
 
@@ -58,6 +58,13 @@
 - **断开后可以立即重连。** 两台设备均更新到 v0.11.2 后，控制端会先结束旧会话，被控端会继续等待下一次连接。「作为被控端」可以保持开启。对于每次只服务一个会话的直连程序（如 `rc-cli host`），连接失败或零帧时会在 2 秒后重试同一地址一次。
 - **解码恢复。** 浏览器遇到 H.264 解码错误时会释放失效的解码器，并从可用的关键帧重新开始显示。连接的实际帧率可在画面顶部查看。
 - **设备显示名自动上报**：被控端上报的 `hostname` 取**宿主机名**（macOS 用「电脑名称」，例如 `mac-mini`），不需要手工设别名；面板优先显示 `alias`，没有就显示 `hostname`。同一台机器跑多个被控端时，可以用角色的后缀区分（例如 `mac-mini · 真桌面`）。
+
+## 本版传输更新
+
+- 使用新版 Core 的视频分片节奏、突发处理和中继调度实现，macOS 编码器采用新版峰值码率余量设置。
+- 自动选路并行准备中继和 P2P，双方使用实际握手选择初始路径。具备切换能力的双端可把已验证的 P2P 候选升级为会话路径；旧端仍可建立普通会话。隔离回环测试通过延迟打洞，已观察到中继持续出帧后升级到 P2P，切换期间视频逐帧校验和输入通过；真实跨网 NAT 的效果仍待验证。面板链路徽标只在实际路径确认后更新。
+- 建议控制端和被控端同时更新。与旧版客户端互连时可回退到普通中继或 P2P，会受到旧端选路等待时间影响。
+- 本插件尚未接入原生应用的运行期定时 P2P 重探测及完整迟滞降级策略。服务端 `v0.1.10` 的双向调度优化需要单独更新服务器，本插件安装包不部署服务器。浏览器继续使用 WebCodecs 解码，Apple Media 依赖升级不代表浏览器改用了 VideoToolbox 解码。
 
 ## 前提与限制
 

@@ -1,0 +1,2073 @@
+//! 应用级偏好设置与设备桌面壁纸快照的原子持久化。
+//!
+//! 本模块全纯 Rust 实现，不依赖 Tauri 事件循环，支持离线确定性单测；
+//! 全模块 `#![deny(unsafe_code)]` 与 `#![deny(missing_docs)]`。
+
+#![deny(unsafe_code)]
+#![deny(missing_docs)]
+
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
+
+use rand::rngs::OsRng;
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+
+use crate::display_ctrl::base64_encode;
+
+/// 默认码率预设名称。
+pub const DEFAULT_BITRATE_PRESET: &str = "14m";
+
+/// 默认码率（bps：14 Mbps）。
+pub const DEFAULT_BITRATE_BPS: u32 = 14_000_000;
+
+/// 默认目标帧率（fps）。
+pub const DEFAULT_FPS: u32 = 144;
+
+/// 允许的码率下限（1 Mbps）。
+pub const MIN_BITRATE_BPS: u32 = 1_000_000;
+
+/// 允许的码率上限（150 Mbps，支撑 4K@120 / 2K@240 / 1K@380 高帧率流）。
+pub const MAX_BITRATE_BPS: u32 = 150_000_000;
+
+/// 允许的帧率下限（15 fps）。
+pub const MIN_FPS: u32 = 15;
+
+/// 允许的帧率上限（380 fps，覆盖 1K@380 / 2K@240 / 4K@120 目标矩阵）。
+pub const MAX_FPS: u32 = 380;
+
+/// 远程终端默认字体大小（px）。
+pub const DEFAULT_TERMINAL_FONT_SIZE: u16 = 13;
+/// 远程终端允许的最小字体大小（px）。
+pub const MIN_TERMINAL_FONT_SIZE: u16 = 10;
+/// 远程终端允许的最大字体大小（px）。
+pub const MAX_TERMINAL_FONT_SIZE: u16 = 28;
+
+/// 客户端安全锁密码最小长度（字符）。
+pub const MIN_CLIENT_LOCK_PASSWORD_LEN: usize = 8;
+/// 客户端安全锁密码最大长度（字符）。
+pub const MAX_CLIENT_LOCK_PASSWORD_LEN: usize = 16;
+/// 客户端安全锁密码 PBKDF2-HMAC-SHA256 迭代次数。
+const CLIENT_LOCK_PBKDF2_ITERS: u32 = 100_000;
+/// 自定义隐私屏保图片最大字节数（4 MiB）。
+pub const MAX_PRIVACY_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// 允许的最小自定义分辨率宽度（像素）。
+pub const MIN_RESOLUTION_WIDTH: u32 = 320;
+
+/// 允许的最小自定义分辨率高度（像素）。
+pub const MIN_RESOLUTION_HEIGHT: u32 = 240;
+
+/// 单张设备桌面壁纸缩略图的最大字节数（96 KiB）。
+pub const MAX_WALLPAPER_BYTES: usize = 96 * 1024;
+
+/// 默认是否开启端到端加密（mTLS）连接（待 Wave 4 实测 mTLS 延迟损耗确认 ≤ 3ms 后最终定稿）。
+pub const DEFAULT_ENCRYPT_CONNECTION: bool = true;
+
+/// 远控连接路由策略模式。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionMode {
+    /// 自动路由（按 LAN → P2P UDP → mTLS 中继优先级自动择优）。
+    #[default]
+    Auto,
+    /// 仅直连 / P2P 模式（拒绝回退至服务端中继）。
+    P2pOnly,
+    /// 强制经服务端 TCP mTLS 中继连接。
+    TcpRelay,
+}
+
+impl ConnectionMode {
+    /// 返回协议与持久化配置的标准小写下划线标识（`"auto"` / `"p2p_only"` / `"tcp_relay"`）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::P2pOnly => "p2p_only",
+            Self::TcpRelay => "tcp_relay",
+        }
+    }
+
+    /// 大小写不敏感解析连接模式字符串（兼容常见横杠与缩写别名）。
+    pub fn parse_lossy(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("auto") {
+            Some(Self::Auto)
+        } else if trimmed.eq_ignore_ascii_case("p2p_only")
+            || trimmed.eq_ignore_ascii_case("p2p-only")
+            || trimmed.eq_ignore_ascii_case("p2p")
+        {
+            Some(Self::P2pOnly)
+        } else if trimmed.eq_ignore_ascii_case("tcp_relay")
+            || trimmed.eq_ignore_ascii_case("tcp-relay")
+            || trimmed.eq_ignore_ascii_case("relay")
+        {
+            Some(Self::TcpRelay)
+        } else {
+            None
+        }
+    }
+}
+
+/// 持久化于本地的单个远端设备快照记录。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DeviceSnapshotRecord {
+    /// 设备可读名称。
+    pub name: String,
+    /// 最近一次连接或刷新时间戳（Unix 秒或毫秒，由调用方统一注入）。
+    pub last_connected_ts: u64,
+    /// 保存在壁纸目录中的安全文件名（不含路径分隔符）。
+    pub wallpaper_file: Option<String>,
+}
+
+/// 面向前端 IPC 展示的设备快照视图（含内联 `data:image/jpeg;base64,...` 壁纸 URL）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceSnapshotView {
+    /// 设备索引键（如地址、设备码或规范化标识）。
+    pub key: String,
+    /// 设备可读名称。
+    pub name: String,
+    /// 最近一次连接时间戳。
+    pub last_connected_ts: u64,
+    /// 内联 Data URL（壁纸缺失或校验失败时为 `None`）。
+    pub wallpaper_data_url: Option<String>,
+}
+
+/// 持久化于本地的单个远端设备 TCP 端口映射规则配置。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SavedPortMapRule {
+    /// 规则显示名称。
+    pub name: String,
+    /// 本机监听端口（`1..=65535`）。
+    pub local_port: u16,
+    /// 远端目标地址（IP 或主机名）。
+    pub target_addr: String,
+    /// 远端目标端口（`1..=65535`）。
+    pub target_port: u16,
+    /// 是否处于启用状态。
+    pub enabled: bool,
+}
+
+/// 持久化于本地磁盘的应用偏好设置。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AppPrefs {
+    /// 是否开启「允许其他设备远控本机」（默认 `false`）。
+    #[serde(default)]
+    pub allow_remote_assist: bool,
+    /// 他人远程协助本机时是否允许文件互传（默认 `true` 兼容存量用户；同账号本人自控始终豁免）。
+    #[serde(default = "default_allow_assist_file_transfer")]
+    pub allow_assist_file_transfer: bool,
+    /// 自定义访问验证码（`None` = 临时验证码模式；`Some("")` = 无密码；`Some(pw)` = 自定义密码）。
+    #[serde(default)]
+    pub custom_host_password: Option<String>,
+    /// 当前选择的码率档位（`"auto"` / `"30m"` / `"14m"` / `"8m"`，默认 `"14m"`）。
+    #[serde(default = "default_bitrate_preset")]
+    pub bitrate_preset: String,
+    /// 当前目标码率（bps，默认 `14_000_000`）。
+    #[serde(default = "default_bitrate_bps")]
+    pub bitrate_bps: u32,
+    /// 当前目标帧率（fps，默认 `144`）。
+    #[serde(default = "default_fps")]
+    pub fps: u32,
+    /// 记住的远控流分辨率宽度（`None` 表示跟随自动协商）。
+    #[serde(default)]
+    pub resolution_width: Option<u32>,
+    /// 记住的远控流分辨率高度（`None` 表示跟随自动协商）。
+    #[serde(default)]
+    pub resolution_height: Option<u32>,
+    /// S1 会话窗口是否显示网络状态 HUD（默认 `true`）。
+    #[serde(default = "default_show_hud")]
+    pub show_hud: bool,
+    /// 退出远控时是否自动锁定被控端屏幕（默认 `false`）。
+    #[serde(default)]
+    pub lock_on_exit: bool,
+    /// 是否默认开启端到端加密（mTLS）连接（默认 `true`）。
+    #[serde(default = "default_encrypt_connection")]
+    pub default_encrypt_connection: bool,
+    /// 是否在设备列表展示局域网发现设备（默认 `false`）。
+    #[serde(default)]
+    pub show_lan_devices: bool,
+    /// 关闭主窗口时是否隐藏到系统菜单栏而非直接退出程序（默认 `true`）。
+    #[serde(default = "default_close_to_tray")]
+    pub close_to_tray: bool,
+    /// W3 远程终端字体来源（`"default"` | `"local"` | `"remote"`）。
+    #[serde(default = "default_terminal_font_source")]
+    pub terminal_font_source: String,
+    /// W3 远程终端选中的字体家族名称（`None` 表示使用内置默认等宽字体）。
+    #[serde(default)]
+    pub terminal_font_family: Option<String>,
+    /// W3 远程终端选中的字体不透明 ID（用于从远程主机按 ID 拉取并缓存字体）。
+    #[serde(default)]
+    pub terminal_font_id: Option<String>,
+    /// W3 远程终端字体大小（px，范围 `10..=28`，默认 `13`）。
+    #[serde(default = "default_terminal_font_size")]
+    pub terminal_font_size: u16,
+    /// 按设备标识索引的历史连接与壁纸快照映射。
+    #[serde(default)]
+    pub device_snapshots: BTreeMap<String, DeviceSnapshotRecord>,
+    /// 按设备标识（或连接目标）持久化的 W4 TCP 端口映射规则列表。
+    #[serde(default)]
+    pub saved_portmaps: BTreeMap<String, Vec<SavedPortMapRule>>,
+    /// 客户端主界面当前是否处于「安全锁定」状态（默认 `false`）。
+    #[serde(default)]
+    pub client_lock_enabled: bool,
+    /// 客户端「安全锁定」PBKDF2 盐值（16 字节小写 hex）。
+    #[serde(default)]
+    pub client_lock_salt_hex: Option<String>,
+    /// 客户端「安全锁定」PBKDF2-HMAC-SHA256 摘要（32 字节小写 hex）。
+    #[serde(default)]
+    pub client_lock_hash_hex: Option<String>,
+    /// 被控端防窥模式偏好（`"off"` | `"privacy"` | `"black"`，默认 `"off"`）。
+    #[serde(default = "default_privacy_mode")]
+    pub privacy_mode: String,
+    /// 隐私屏保选中的预设标识（`"default_dark"` | `"guard"` | `"work"` | `"terminal"` | `"focus"` | `"bluescreen"` | `"custom"`）。
+    #[serde(default = "default_privacy_preset")]
+    pub privacy_preset: String,
+    /// 自定义隐私屏保图片文件名（位于 `privacy/` 目录内）。
+    #[serde(default)]
+    pub privacy_custom_image: Option<String>,
+    /// 远控连接时是否自动静音被控端（默认 `false`）。
+    #[serde(default)]
+    pub host_mute_on_connect: bool,
+    /// 远程结束后是否恢复被控端声音设置（默认 `true`）。
+    #[serde(default = "default_host_restore_audio_on_exit")]
+    pub host_restore_audio_on_exit: bool,
+    /// 外设：是否发送系统快捷键到被控端（如 `Cmd+Tab`，默认 `true`）。
+    #[serde(default = "default_send_system_shortcuts")]
+    pub send_system_shortcuts: bool,
+    /// 外设：不透传到被控端的系统快捷键例外列表（例如 `["Cmd+Space"]`）。
+    #[serde(default)]
+    pub shortcut_exceptions: Vec<String>,
+    /// 外设：鼠标模式（`"smart"` | `"remote"` | `"local"`，默认 `"smart"`）。
+    #[serde(default = "default_mouse_mode")]
+    pub mouse_mode: String,
+    /// 可选应用更新镜像加速前缀（空串表示直连 GitHub Releases；非空时必须为 `https://`）。
+    #[serde(default)]
+    pub update_mirror_url: String,
+    /// 可选 W2 文件传输自定义存储路径（`None` 表示使用平台默认接收目录）。
+    #[serde(default)]
+    pub file_transfer_dir: Option<String>,
+    /// 远控连接路由策略（`"auto"` / `"p2p_only"` / `"tcp_relay"`，默认 `Auto`）。
+    #[serde(default)]
+    pub connection_mode: ConnectionMode,
+    /// 是否启用 UPnP IGD / NAT-PMP 自动端口映射以提升 P2P 直连成功率（默认 `true`）。
+    #[serde(default = "default_upnp_enabled")]
+    pub upnp_enabled: bool,
+    /// 是否开启静止画面 Tile 级无损文字锐化补帧（默认 `true`）。
+    #[serde(default = "default_still_refinement_enabled")]
+    pub still_refinement_enabled: bool,
+    /// 出站网络代理配置（支持 `none` / `system` / `manual` 与 HTTP CONNECT / SOCKS5，默认禁用）。
+    #[serde(default)]
+    pub proxy: crate::proxy::ProxyConfig,
+    /// 是否允许本机作为被控设备接受同账号 Wake-on-LAN 远程开机（默认 `false`）。
+    #[serde(default)]
+    pub allow_wol: bool,
+}
+
+fn default_upnp_enabled() -> bool {
+    true
+}
+
+fn default_still_refinement_enabled() -> bool {
+    true
+}
+
+fn default_allow_assist_file_transfer() -> bool {
+    true
+}
+
+fn default_privacy_mode() -> String {
+    "off".to_string()
+}
+
+fn default_privacy_preset() -> String {
+    "preset-1".to_string()
+}
+
+fn default_host_restore_audio_on_exit() -> bool {
+    true
+}
+
+fn default_send_system_shortcuts() -> bool {
+    true
+}
+
+fn default_mouse_mode() -> String {
+    "smart".to_string()
+}
+
+fn default_bitrate_preset() -> String {
+    DEFAULT_BITRATE_PRESET.to_string()
+}
+
+fn default_bitrate_bps() -> u32 {
+    DEFAULT_BITRATE_BPS
+}
+
+fn default_fps() -> u32 {
+    DEFAULT_FPS
+}
+
+fn default_show_hud() -> bool {
+    true
+}
+
+fn default_encrypt_connection() -> bool {
+    DEFAULT_ENCRYPT_CONNECTION
+}
+
+fn default_close_to_tray() -> bool {
+    true
+}
+
+fn default_terminal_font_source() -> String {
+    "default".to_string()
+}
+
+fn default_terminal_font_size() -> u16 {
+    DEFAULT_TERMINAL_FONT_SIZE
+}
+
+impl Default for AppPrefs {
+    fn default() -> Self {
+        Self {
+            allow_remote_assist: false,
+            allow_assist_file_transfer: default_allow_assist_file_transfer(),
+            custom_host_password: None,
+            bitrate_preset: default_bitrate_preset(),
+            bitrate_bps: DEFAULT_BITRATE_BPS,
+            fps: DEFAULT_FPS,
+            resolution_width: None,
+            resolution_height: None,
+            show_hud: true,
+            lock_on_exit: false,
+            default_encrypt_connection: DEFAULT_ENCRYPT_CONNECTION,
+            show_lan_devices: false,
+            close_to_tray: true,
+            terminal_font_source: default_terminal_font_source(),
+            terminal_font_family: None,
+            terminal_font_id: None,
+            terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
+            device_snapshots: BTreeMap::new(),
+            saved_portmaps: BTreeMap::new(),
+            client_lock_enabled: false,
+            client_lock_salt_hex: None,
+            client_lock_hash_hex: None,
+            privacy_mode: default_privacy_mode(),
+            privacy_preset: default_privacy_preset(),
+            privacy_custom_image: None,
+            host_mute_on_connect: false,
+            host_restore_audio_on_exit: default_host_restore_audio_on_exit(),
+            send_system_shortcuts: default_send_system_shortcuts(),
+            shortcut_exceptions: Vec::new(),
+            mouse_mode: default_mouse_mode(),
+            update_mirror_url: String::new(),
+            file_transfer_dir: None,
+            connection_mode: ConnectionMode::Auto,
+            upnp_enabled: default_upnp_enabled(),
+            still_refinement_enabled: default_still_refinement_enabled(),
+            proxy: crate::proxy::ProxyConfig::default(),
+            allow_wol: false,
+        }
+    }
+}
+
+/// W3 远程终端字体偏好的增量更新补丁（经 Tauri IPC 反序列化）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TerminalPrefsPatch {
+    /// 字体来源（`"default"` | `"local"` | `"remote"`）。
+    pub terminal_font_source: Option<String>,
+    /// 字体家族名称（传空串或 `clear_font == Some(true)` 清空为默认）。
+    pub terminal_font_family: Option<String>,
+    /// 远程/本地字体不透明 ID。
+    pub terminal_font_id: Option<String>,
+    /// 为 `Some(true)` 时重置字体为默认等宽字体。
+    pub clear_font: Option<bool>,
+    /// 字号（px，范围 `10..=28`）。
+    pub terminal_font_size: Option<u16>,
+}
+
+/// 按目标分辨率与帧率计算 `"auto"` 档位的推荐目标码率（bps），支撑 1080p60 到 4K@120 / 2K@240 / 1K@380。
+pub fn recommended_auto_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
+    let pixel_rate =
+        u64::from(width.max(640)) * u64::from(height.max(360)) * u64::from(fps.max(15));
+    let bps = if pixel_rate >= 700_000_000 {
+        120_000_000
+    } else if pixel_rate >= 450_000_000 {
+        80_000_000
+    } else if pixel_rate >= 250_000_000 {
+        50_000_000
+    } else if pixel_rate >= 150_000_000 {
+        30_000_000
+    } else {
+        14_000_000
+    };
+    bps.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
+}
+
+/// 安全、连接加密与设备可见性偏好的增量更新补丁（经 Tauri IPC 反序列化）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SecurityPrefsPatch {
+    /// 可选「允许其他设备远程协助本机」开关。
+    pub allow_remote_assist: Option<bool>,
+    /// 可选「默认开启加密连接（mTLS）」开关。
+    pub default_encrypt_connection: Option<bool>,
+    /// 可选「显示局域网设备」开关。
+    pub show_lan_devices: Option<bool>,
+    /// 可选自定义访问验证码（`Some("")` 表示无密码；`Some(pw)` 长度不超过 64 字符且无控制字符）。
+    pub custom_host_password: Option<String>,
+    /// 为 `Some(true)` 时清除自定义密码并切回临时验证码模式。
+    pub clear_custom_host_password: Option<bool>,
+}
+
+/// S1 远控流与 HUD 偏好的增量更新补丁（经 Tauri IPC 反序列化）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StreamPrefsPatch {
+    /// 可选码率档位（`"auto"` / `"30m"` / `"14m"` / `"8m"`）。
+    pub bitrate_preset: Option<String>,
+    /// 可选目标码率（bps，范围 `1_000_000..=60_000_000`）。
+    pub bitrate_bps: Option<u32>,
+    /// 可选目标帧率（fps，范围 `15..=240`）。
+    pub fps: Option<u32>,
+    /// 可选目标分辨率宽度（需与 `resolution_height` 成对提供，且 `>= 320`）。
+    pub resolution_width: Option<u32>,
+    /// 可选目标分辨率高度（需与 `resolution_width` 成对提供，且 `>= 240`）。
+    pub resolution_height: Option<u32>,
+    /// 为 `Some(true)` 时清除已保存的自定义分辨率。
+    pub clear_resolution: Option<bool>,
+    /// 可选 HUD 显隐开关。
+    pub show_hud: Option<bool>,
+    /// 可选「退出时锁定被控端」开关。
+    pub lock_on_exit: Option<bool>,
+}
+
+/// 被控端防窥模式与静音偏好的增量补丁。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PrivacyPrefsPatch {
+    /// 防窥模式（`"off"` | `"privacy"` | `"black"`）。
+    pub privacy_mode: Option<String>,
+    /// 隐私屏保预设（`"default_dark"` | `"guard"` | `"work"` | `"terminal"` | `"focus"` | `"bluescreen"` | `"custom"`）。
+    pub privacy_preset: Option<String>,
+    /// 连接时是否自动静音被控端。
+    pub host_mute_on_connect: Option<bool>,
+    /// 远程结束后是否恢复被控端声音设置。
+    pub host_restore_audio_on_exit: Option<bool>,
+}
+
+/// 外设偏好（系统快捷键透传、例外规则与鼠标模式）的增量补丁。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PeripheralsPrefsPatch {
+    /// 是否将系统快捷键（如 `Cmd+Tab`）发送到被控端。
+    pub send_system_shortcuts: Option<bool>,
+    /// 例外快捷键列表（保持由本机响应）。
+    pub shortcut_exceptions: Option<Vec<String>>,
+    /// 鼠标模式（`"smart"` | `"remote"` | `"local"`）。
+    pub mouse_mode: Option<String>,
+}
+
+fn decode_hex_bytes(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
+/// 对账号字符串做脱敏展示（邮箱保留首尾并遮罩中间，手机号保留前 3 后 2）。
+pub fn mask_account_display(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some((local, domain)) = trimmed.split_once('@') {
+        let chars: Vec<char> = local.chars().collect();
+        let masked_local = if chars.len() <= 2 {
+            format!("{}***", chars.first().copied().unwrap_or('*'))
+        } else if chars.len() <= 4 {
+            format!("{}{}***", chars[0], chars[1])
+        } else {
+            format!("{}{}****{}", chars[0], chars[1], chars[chars.len() - 1])
+        };
+        format!("{masked_local}@{domain}")
+    } else {
+        let chars: Vec<char> = trimmed.chars().collect();
+        if chars.len() <= 5 {
+            format!("{}***", chars.first().copied().unwrap_or('*'))
+        } else {
+            let head: String = chars[..3].iter().collect();
+            let tail: String = chars[chars.len() - 2..].iter().collect();
+            format!("{head}******{tail}")
+        }
+    }
+}
+
+/// 返回自定义隐私屏保图片保存目录（`<config_dir>/privacy`）。
+pub fn default_privacy_dir() -> PathBuf {
+    crate::config_paths::config_dir().join("privacy")
+}
+
+/// 原子保存自定义隐私屏保图片（PNG/JPEG/WebP，最大 4 MiB）并返回文件名。
+pub fn save_privacy_custom_image(dir: &Path, bytes: &[u8]) -> Result<String, String> {
+    if bytes.is_empty() {
+        return Err("图片数据不能为空".to_string());
+    }
+    if bytes.len() > MAX_PRIVACY_IMAGE_BYTES {
+        return Err("自定义隐私屏保图片不能超过 4 MB".to_string());
+    }
+    let ext = if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        "png"
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "jpg"
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "webp"
+    } else {
+        return Err("仅支持 PNG、JPEG 或 WebP 格式图片".to_string());
+    };
+    let filename = format!("custom-curtain.{ext}");
+    let target = dir.join(&filename);
+    atomic_write_bytes(&target, bytes, false).map_err(|e| format!("保存隐私屏保图片失败：{e}"))?;
+    Ok(filename)
+}
+
+/// 从隐私屏保目录安全读取指定图片字节（校验无路径穿越）。
+pub fn load_privacy_custom_image(dir: &Path, filename: &str) -> Option<Vec<u8>> {
+    let mut comps = Path::new(filename).components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Normal(_)), None) => {}
+        _ => return None,
+    }
+    let path = dir.join(filename);
+    let data = fs::read(path).ok()?;
+    if data.is_empty() || data.len() > MAX_PRIVACY_IMAGE_BYTES {
+        return None;
+    }
+    Some(data)
+}
+
+fn is_valid_bitrate_preset(preset: &str) -> bool {
+    matches!(
+        preset,
+        "auto" | "150m" | "100m" | "60m" | "30m" | "14m" | "8m"
+    )
+}
+
+fn is_valid_terminal_font_source(src: &str) -> bool {
+    matches!(src, "default" | "local" | "remote")
+}
+
+fn sanitize_font_label(raw: Option<String>, max_chars: usize) -> Result<Option<String>, String> {
+    let Some(val) = raw else {
+        return Ok(None);
+    };
+    let trimmed = val.trim().to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > max_chars || trimmed.chars().any(char::is_control) {
+        return Err(format!("字体配置包含非法控制字符或超过 {max_chars} 个字符"));
+    }
+    Ok(Some(trimmed))
+}
+
+impl AppPrefs {
+    /// 校验并原子应用远控流与 HUD 偏好增量补丁。
+    ///
+    /// 若任一字段校验失败则返回 `Err` 且保持原对象完全不变：
+    /// - `bitrate_preset` 须属于 `["auto", "30m", "14m", "8m"]`；
+    /// - `bitrate_bps` 须在 `1_000_000..=60_000_000`；
+    /// - `fps` 须在 `15..=240`；
+    /// - 若 `clear_resolution == Some(true)` 则清空分辨率；否则若传入分辨率宽高，
+    ///   必须成对提供且满足 `width >= 320 && height >= 240`。
+    pub fn apply_stream_patch(&mut self, patch: StreamPrefsPatch) -> Result<(), String> {
+        if let Some(ref preset) = patch.bitrate_preset {
+            if !is_valid_bitrate_preset(preset) {
+                return Err(format!(
+                    "无效码率档位：{preset:?}（允许 auto / 30m / 14m / 8m）"
+                ));
+            }
+        }
+        if let Some(bps) = patch.bitrate_bps {
+            if !(MIN_BITRATE_BPS..=MAX_BITRATE_BPS).contains(&bps) {
+                return Err(format!(
+                    "码率超出允许范围：{bps}（允许 {MIN_BITRATE_BPS}..={MAX_BITRATE_BPS} bps）"
+                ));
+            }
+        }
+        if let Some(fps) = patch.fps {
+            if !(MIN_FPS..=MAX_FPS).contains(&fps) {
+                return Err(format!(
+                    "帧率超出允许范围：{fps}（允许 {MIN_FPS}..={MAX_FPS} fps）"
+                ));
+            }
+        }
+
+        let clear_res = patch.clear_resolution.unwrap_or(false);
+        let next_res = if clear_res {
+            Some((None, None))
+        } else {
+            match (patch.resolution_width, patch.resolution_height) {
+                (None, None) => None,
+                (Some(w), Some(h)) => {
+                    if w < MIN_RESOLUTION_WIDTH || h < MIN_RESOLUTION_HEIGHT {
+                        return Err(format!(
+                            "分辨率过小：{w}×{h}（最小 {MIN_RESOLUTION_WIDTH}×{MIN_RESOLUTION_HEIGHT}）"
+                        ));
+                    }
+                    Some((Some(w), Some(h)))
+                }
+                _ => {
+                    return Err("resolutionWidth 与 resolutionHeight 必须同时提供".to_string());
+                }
+            }
+        };
+
+        if let Some(preset) = patch.bitrate_preset {
+            self.bitrate_preset = preset;
+        }
+        if let Some(bps) = patch.bitrate_bps {
+            self.bitrate_bps = bps;
+        }
+        if let Some(fps) = patch.fps {
+            self.fps = fps;
+        }
+        if let Some((w, h)) = next_res {
+            self.resolution_width = w;
+            self.resolution_height = h;
+        }
+        if let Some(show_hud) = patch.show_hud {
+            self.show_hud = show_hud;
+        }
+        if let Some(lock_on_exit) = patch.lock_on_exit {
+            self.lock_on_exit = lock_on_exit;
+        }
+        Ok(())
+    }
+
+    /// 校验并原子应用安全与加密偏好增量补丁。
+    ///
+    /// 若任一字段校验失败则返回 `Err` 且保持原对象完全不变：
+    /// - 若 `clear_custom_host_password == Some(true)` 则清空自定义密码；
+    /// - 否则若传入 `custom_host_password`，须满足字符数 `<= 64` 且不含控制字符或 NUL。
+    pub fn apply_security_patch(&mut self, patch: SecurityPrefsPatch) -> Result<(), String> {
+        let clear_pw = patch.clear_custom_host_password.unwrap_or(false);
+        if !clear_pw {
+            if let Some(ref pw) = patch.custom_host_password {
+                if pw.chars().count() > 64 || pw.chars().any(|ch| ch.is_control() || ch == '\0') {
+                    return Err(
+                        "自定义访问验证码长度不能超过 64 个字符，且不能包含控制字符".to_string()
+                    );
+                }
+            }
+        }
+
+        if let Some(v) = patch.allow_remote_assist {
+            self.allow_remote_assist = v;
+        }
+        if let Some(v) = patch.default_encrypt_connection {
+            self.default_encrypt_connection = v;
+        }
+        if let Some(v) = patch.show_lan_devices {
+            self.show_lan_devices = v;
+        }
+        if clear_pw {
+            self.custom_host_password = None;
+        } else if let Some(pw) = patch.custom_host_password {
+            self.custom_host_password = Some(pw);
+        }
+        Ok(())
+    }
+
+    /// 校验并原子应用 W3 远程终端字体与字号偏好。
+    pub fn apply_terminal_patch(&mut self, patch: TerminalPrefsPatch) -> Result<(), String> {
+        if let Some(ref src) = patch.terminal_font_source {
+            if !is_valid_terminal_font_source(src) {
+                return Err(format!(
+                    "无效终端字体来源：{src:?}（允许 default / local / remote）"
+                ));
+            }
+        }
+        if let Some(sz) = patch.terminal_font_size {
+            if !(MIN_TERMINAL_FONT_SIZE..=MAX_TERMINAL_FONT_SIZE).contains(&sz) {
+                return Err(format!(
+                    "终端字号超出允许范围：{sz}（允许 {MIN_TERMINAL_FONT_SIZE}..={MAX_TERMINAL_FONT_SIZE}）"
+                ));
+            }
+        }
+        let next_family = if patch.clear_font.unwrap_or(false) {
+            Some(None)
+        } else {
+            match patch.terminal_font_family {
+                Some(v) => Some(sanitize_font_label(Some(v), 128)?),
+                None => None,
+            }
+        };
+        let next_id = if patch.clear_font.unwrap_or(false) {
+            Some(None)
+        } else {
+            match patch.terminal_font_id {
+                Some(v) => Some(sanitize_font_label(Some(v), 64)?),
+                None => None,
+            }
+        };
+
+        if let Some(src) = patch.terminal_font_source {
+            self.terminal_font_source = src;
+        }
+        if let Some(fam) = next_family {
+            self.terminal_font_family = fam;
+        }
+        if let Some(id) = next_id {
+            self.terminal_font_id = id;
+        }
+        if self.terminal_font_source == "default" {
+            self.terminal_font_family = None;
+            self.terminal_font_id = None;
+        }
+        if let Some(sz) = patch.terminal_font_size {
+            self.terminal_font_size = sz;
+        }
+        Ok(())
+    }
+
+    /// 判断是否已配置客户端「安全锁定」密码。
+    pub fn has_client_lock_password(&self) -> bool {
+        self.client_lock_salt_hex
+            .as_deref()
+            .is_some_and(|s| s.len() == 32 && decode_hex_bytes(s).is_some())
+            && self
+                .client_lock_hash_hex
+                .as_deref()
+                .is_some_and(|h| h.len() == 64 && decode_hex_bytes(h).is_some())
+    }
+
+    /// 校验并设置客户端「安全锁定」密码（8–16 位，使用 PBKDF2-HMAC-SHA256 加随机盐安全存储，不落明文）。
+    pub fn set_client_lock_password(&mut self, password: &str) -> Result<(), String> {
+        let len = password.chars().count();
+        if !(MIN_CLIENT_LOCK_PASSWORD_LEN..=MAX_CLIENT_LOCK_PASSWORD_LEN).contains(&len) {
+            return Err(format!(
+                "安全密码长度必须为 {MIN_CLIENT_LOCK_PASSWORD_LEN}-{MAX_CLIENT_LOCK_PASSWORD_LEN} 位"
+            ));
+        }
+        if password.chars().any(|ch| ch.is_control() || ch == '\0') {
+            return Err("安全密码不能包含控制字符".to_string());
+        }
+        let mut salt = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+        let mut hash = [0u8; 32];
+        let iters = std::num::NonZeroU32::new(CLIENT_LOCK_PBKDF2_ITERS)
+            .expect("CLIENT_LOCK_PBKDF2_ITERS must be non-zero");
+        ring::pbkdf2::derive(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            iters,
+            &salt,
+            password.as_bytes(),
+            &mut hash,
+        );
+        self.client_lock_salt_hex = Some(encode_hex_lower(&salt));
+        self.client_lock_hash_hex = Some(encode_hex_lower(&hash));
+        Ok(())
+    }
+
+    /// 常量时间校验输入的客户端「安全锁定」密码是否正确。
+    pub fn verify_client_lock_password(&self, password: &str) -> bool {
+        let (Some(salt_hex), Some(hash_hex)) = (
+            self.client_lock_salt_hex.as_deref(),
+            self.client_lock_hash_hex.as_deref(),
+        ) else {
+            return false;
+        };
+        let (Some(salt), Some(expected)) = (decode_hex_bytes(salt_hex), decode_hex_bytes(hash_hex))
+        else {
+            return false;
+        };
+        if salt.len() != 16 || expected.len() != 32 {
+            return false;
+        }
+        let iters = std::num::NonZeroU32::new(CLIENT_LOCK_PBKDF2_ITERS)
+            .expect("CLIENT_LOCK_PBKDF2_ITERS must be non-zero");
+        ring::pbkdf2::verify(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            iters,
+            &salt,
+            password.as_bytes(),
+            &expected,
+        )
+        .is_ok()
+    }
+
+    /// 校验并原子应用防窥模式与被控端静音偏好。
+    pub fn apply_privacy_patch(&mut self, patch: PrivacyPrefsPatch) -> Result<(), String> {
+        if let Some(ref mode) = patch.privacy_mode {
+            if !matches!(mode.as_str(), "off" | "privacy" | "black") {
+                return Err(format!("无效防窥模式：{mode:?}"));
+            }
+        }
+        if let Some(ref preset) = patch.privacy_preset {
+            if !matches!(
+                preset.as_str(),
+                "preset-1"
+                    | "preset-2"
+                    | "preset-3"
+                    | "preset-4"
+                    | "preset-5"
+                    | "preset-6"
+                    | "custom"
+            ) {
+                return Err(format!("无效隐私屏保预设：{preset:?}"));
+            }
+        }
+        if let Some(mode) = patch.privacy_mode {
+            self.privacy_mode = mode;
+        }
+        if let Some(preset) = patch.privacy_preset {
+            self.privacy_preset = preset;
+        }
+        if let Some(mute) = patch.host_mute_on_connect {
+            self.host_mute_on_connect = mute;
+        }
+        if let Some(restore) = patch.host_restore_audio_on_exit {
+            self.host_restore_audio_on_exit = restore;
+        }
+        Ok(())
+    }
+
+    /// 校验并原子应用外设偏好（系统快捷键透传、例外列表与鼠标模式）。
+    pub fn apply_peripherals_patch(&mut self, patch: PeripheralsPrefsPatch) -> Result<(), String> {
+        if let Some(ref mode) = patch.mouse_mode {
+            if !matches!(mode.as_str(), "smart" | "remote" | "local") {
+                return Err(format!("无效鼠标模式：{mode:?}"));
+            }
+        }
+        if let Some(ref list) = patch.shortcut_exceptions {
+            if list.len() > 32 {
+                return Err("快捷键例外列表最多支持 32 项".to_string());
+            }
+            for item in list {
+                let t = item.trim();
+                if t.is_empty() || t.chars().count() > 32 || t.chars().any(char::is_control) {
+                    return Err(format!("无效快捷键配置：{item:?}"));
+                }
+            }
+        }
+        if let Some(send) = patch.send_system_shortcuts {
+            self.send_system_shortcuts = send;
+        }
+        if let Some(list) = patch.shortcut_exceptions {
+            let mut dedup = Vec::with_capacity(list.len());
+            for item in list {
+                let clean = item.trim().to_string();
+                if !dedup.contains(&clean) {
+                    dedup.push(clean);
+                }
+            }
+            self.shortcut_exceptions = dedup;
+        }
+        if let Some(mode) = patch.mouse_mode {
+            self.mouse_mode = mode;
+        }
+        Ok(())
+    }
+
+    /// 校验并更新可选的更新下载镜像加速前缀（空串表示直连 GitHub Releases）。
+    pub fn apply_update_mirror_url(&mut self, mirror_url: &str) -> Result<(), String> {
+        self.update_mirror_url = crate::updater::sanitize_update_mirror_url(mirror_url)?;
+        Ok(())
+    }
+
+    /// 返回当前生效的文件传输接收目录（未配置或配置无效时回退至平台默认目录）。
+    pub fn resolved_file_transfer_dir(&self) -> PathBuf {
+        match self.file_transfer_dir.as_deref() {
+            Some(raw) => match sanitize_file_transfer_dir(raw) {
+                Ok(Some(clean)) => PathBuf::from(clean),
+                _ => default_file_transfer_dir(),
+            },
+            None => default_file_transfer_dir(),
+        }
+    }
+
+    /// 判断当前是否使用平台默认文件传输接收目录。
+    pub fn is_default_file_transfer_dir(&self) -> bool {
+        self.file_transfer_dir.is_none()
+            || self.resolved_file_transfer_dir() == default_file_transfer_dir()
+    }
+
+    /// 校验并更新文件传输接收目录；传入 `None` 或空串时恢复默认，返回生效路径。
+    pub fn apply_file_transfer_dir(&mut self, raw: Option<String>) -> Result<PathBuf, String> {
+        let next = match raw {
+            None => None,
+            Some(s) => sanitize_file_transfer_dir(&s)?,
+        };
+        self.file_transfer_dir = next;
+        Ok(self.resolved_file_transfer_dir())
+    }
+
+    /// 读取自定义隐私屏保图片的 `data:image/...;base64,...` 预览 URL。
+    pub fn privacy_custom_data_url(&self, dir: &Path) -> Option<String> {
+        let name = self.privacy_custom_image.as_deref()?;
+        let bytes = load_privacy_custom_image(dir, name)?;
+        let mime = if name.ends_with(".png") {
+            "image/png"
+        } else if name.ends_with(".webp") {
+            "image/webp"
+        } else {
+            "image/jpeg"
+        };
+        Some(format!("data:{mime};base64,{}", base64_encode(&bytes)))
+    }
+
+    /// 导出包含内联 Data URL 的设备快照视图列表。
+    pub fn snapshot_views(&self, wallpapers_dir: &Path) -> Vec<DeviceSnapshotView> {
+        self.device_snapshots
+            .iter()
+            .map(|(key, rec)| DeviceSnapshotView {
+                key: key.clone(),
+                name: rec.name.clone(),
+                last_connected_ts: rec.last_connected_ts,
+                wallpaper_data_url: rec
+                    .wallpaper_file
+                    .as_deref()
+                    .and_then(|file| load_device_wallpaper_data_url(wallpapers_dir, file)),
+            })
+            .collect()
+    }
+
+    /// 更新指定设备的 W4 持久化端口映射规则列表（过滤无效项并截断至最多 32 条；空列表移除该设备键）。
+    pub fn set_device_portmaps(&mut self, device_key: &str, rules: Vec<SavedPortMapRule>) {
+        let key = device_key.trim();
+        if key.is_empty() {
+            return;
+        }
+        let mut clean = Vec::new();
+        for mut rule in rules {
+            rule.name = rule.name.trim().to_string();
+            rule.target_addr = rule.target_addr.trim().to_string();
+            if rule.name.is_empty()
+                || rule.target_addr.is_empty()
+                || rule
+                    .target_addr
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control())
+                || rule.local_port == 0
+                || rule.target_port == 0
+            {
+                continue;
+            }
+            if clean.len() >= 32 {
+                break;
+            }
+            clean.push(rule);
+        }
+        if clean.is_empty() {
+            self.saved_portmaps.remove(key);
+        } else {
+            self.saved_portmaps.insert(key.to_string(), clean);
+        }
+    }
+}
+
+pub(crate) fn config_root_dir() -> PathBuf {
+    crate::config_paths::config_dir()
+}
+
+/// 返回默认应用偏好文件路径：`$HOME/.config/rabbitcontrol/prefs.json`。
+pub fn default_prefs_path() -> PathBuf {
+    config_root_dir().join("prefs.json")
+}
+
+/// 返回默认设备壁纸缓存目录：`$HOME/.config/rabbitcontrol/wallpapers`。
+pub fn default_wallpapers_dir() -> PathBuf {
+    config_root_dir().join("wallpapers")
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+}
+
+/// 返回文件传输的平台默认接收目录。
+///
+/// - macOS：`<HOME>/Library/Application Support/RabbitControl/Download`；
+/// - 其他平台：`<HOME/USERPROFILE>/Downloads/RabbitControl`；
+/// - 用户主目录环境变量不可用时回退至 `<user_config_dir>/Download`。
+pub fn default_file_transfer_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            return PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("RabbitControl")
+                .join("Download");
+        }
+        crate::config_paths::user_config_dir().join("Download")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(home) = user_home_dir() {
+            return home.join("Downloads").join("RabbitControl");
+        }
+        crate::config_paths::user_config_dir().join("Download")
+    }
+}
+
+fn reject_tilde_absolute_suffix(rest: &str) -> Result<(), String> {
+    if rest.starts_with('/')
+        || rest.starts_with('\\')
+        || Path::new(rest).is_absolute()
+        || matches!(
+            Path::new(rest).components().next(),
+            Some(Component::Prefix(_) | Component::RootDir)
+        )
+    {
+        return Err("文件传输存储路径格式无效".to_string());
+    }
+    Ok(())
+}
+
+fn is_windows_unc_share_root(path: &str) -> bool {
+    let body = if let Some(rest) = path
+        .strip_prefix("\\\\?\\UNC\\")
+        .or_else(|| path.strip_prefix("\\\\.\\UNC\\"))
+    {
+        rest
+    } else if let Some(rest) = path.strip_prefix("\\\\") {
+        if rest.starts_with("?\\") || rest.starts_with(".\\") {
+            return false;
+        }
+        rest
+    } else {
+        return false;
+    };
+    let seg_count = body
+        .split(['\\', '/'])
+        .filter(|seg| !seg.is_empty())
+        .count();
+    seg_count <= 2
+}
+
+fn trim_trailing_separators(normalized: &mut String, is_windows: bool) {
+    if is_windows {
+        while normalized.len() > 1 {
+            let ends_sep = normalized.ends_with('/') || normalized.ends_with('\\');
+            if !ends_sep {
+                break;
+            }
+            // 保留普通盘符根（如 `C:\`、`C:/`）与 verbatim/device 盘符根（如 `\\?\C:\`）。
+            if normalized.as_bytes().get(normalized.len() - 2) == Some(&b':') {
+                break;
+            }
+            // 保留 UNC 共享根目录（如 `\\server\share\`、`\\?\UNC\server\share\`）。
+            if is_windows_unc_share_root(normalized) {
+                break;
+            }
+            #[cfg(windows)]
+            if Path::new(normalized.as_str()).parent().is_none() {
+                break;
+            }
+            normalized.pop();
+        }
+    } else {
+        while normalized.len() > 1 && normalized.ends_with('/') {
+            normalized.pop();
+        }
+    }
+}
+
+/// 校验并规范化自定义文件传输接收目录路径。
+///
+/// - 空串或纯空白返回 `Ok(None)`（恢复默认）；
+/// - 拒绝 NUL 与任意控制字符（`char::is_control`）；
+/// - 展开前导 `~` / `~/`（Windows 同时支持 `~\`），并拒绝 `~//...` 等覆盖主目录的后缀；
+/// - 拒绝包含 `..`（`Component::ParentDir`）的穿越路径；
+/// - 要求结果为绝对路径，并去除非根目录尾部分隔符（保留 POSIX `/`、Windows 盘符/verbatim 根与 UNC 共享根）。
+pub fn sanitize_file_transfer_dir(raw: &str) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("文件传输存储路径不能包含控制字符".to_string());
+    }
+
+    let expanded: PathBuf = if trimmed == "~" {
+        user_home_dir().ok_or_else(|| "无法解析用户主目录（~）".to_string())?
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        reject_tilde_absolute_suffix(rest)?;
+        let home = user_home_dir().ok_or_else(|| "无法解析用户主目录（~）".to_string())?;
+        if rest.is_empty() {
+            home
+        } else {
+            home.join(rest)
+        }
+    } else if cfg!(windows) && trimmed.starts_with("~\\") {
+        let rest = &trimmed[2..];
+        reject_tilde_absolute_suffix(rest)?;
+        let home = user_home_dir().ok_or_else(|| "无法解析用户主目录（~）".to_string())?;
+        if rest.is_empty() {
+            home
+        } else {
+            home.join(rest)
+        }
+    } else {
+        PathBuf::from(trimmed)
+    };
+
+    if expanded
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err("文件传输存储路径不能包含父目录引用（..）".to_string());
+    }
+
+    if !expanded.is_absolute() {
+        return Err("文件传输存储路径必须为绝对路径".to_string());
+    }
+
+    let mut normalized = expanded.to_string_lossy().into_owned();
+    trim_trailing_separators(&mut normalized, cfg!(windows));
+
+    Ok(Some(normalized))
+}
+
+pub(crate) fn encode_hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0F) as usize] as char);
+    }
+    out
+}
+
+fn sanitize_prefs(prefs: &mut AppPrefs) {
+    if let Some(ref pw) = prefs.custom_host_password {
+        if pw.chars().count() > 64 || pw.chars().any(|ch| ch.is_control() || ch == '\0') {
+            prefs.custom_host_password = None;
+        }
+    }
+    if !is_valid_bitrate_preset(&prefs.bitrate_preset) {
+        prefs.bitrate_preset = default_bitrate_preset();
+    }
+    if !(MIN_BITRATE_BPS..=MAX_BITRATE_BPS).contains(&prefs.bitrate_bps) {
+        prefs.bitrate_bps = DEFAULT_BITRATE_BPS;
+    }
+    if !(MIN_FPS..=MAX_FPS).contains(&prefs.fps) {
+        prefs.fps = DEFAULT_FPS;
+    }
+    if !is_valid_terminal_font_source(&prefs.terminal_font_source) {
+        prefs.terminal_font_source = default_terminal_font_source();
+    }
+    if !(MIN_TERMINAL_FONT_SIZE..=MAX_TERMINAL_FONT_SIZE).contains(&prefs.terminal_font_size) {
+        prefs.terminal_font_size = DEFAULT_TERMINAL_FONT_SIZE;
+    }
+    if let Ok(clean_fam) = sanitize_font_label(prefs.terminal_font_family.take(), 128) {
+        prefs.terminal_font_family = clean_fam;
+    }
+    if let Ok(clean_id) = sanitize_font_label(prefs.terminal_font_id.take(), 64) {
+        prefs.terminal_font_id = clean_id;
+    }
+    let valid_res = matches!(
+        (prefs.resolution_width, prefs.resolution_height),
+        (Some(w), Some(h)) if w >= MIN_RESOLUTION_WIDTH && h >= MIN_RESOLUTION_HEIGHT
+    );
+    if !valid_res {
+        prefs.resolution_width = None;
+        prefs.resolution_height = None;
+    }
+    for rec in prefs.device_snapshots.values_mut() {
+        if let Some(ref file) = rec.wallpaper_file {
+            if !is_safe_wallpaper_filename(file) {
+                rec.wallpaper_file = None;
+            }
+        }
+    }
+    prefs.saved_portmaps.retain(|k, rules| {
+        if k.trim().is_empty() {
+            return false;
+        }
+        for r in rules.iter_mut() {
+            r.name = r.name.trim().to_string();
+            r.target_addr = r.target_addr.trim().to_string();
+        }
+        rules.retain(|r| {
+            !r.name.is_empty()
+                && !r.target_addr.is_empty()
+                && !r
+                    .target_addr
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control())
+                && r.local_port > 0
+                && r.target_port > 0
+        });
+        rules.truncate(32);
+        !rules.is_empty()
+    });
+    // 客户端安全锁定：若磁盘配置缺失/损坏盐值或哈希，强制关闭锁定避免永久锁死无法解锁。
+    if !prefs.has_client_lock_password() {
+        prefs.client_lock_enabled = false;
+        prefs.client_lock_salt_hex = None;
+        prefs.client_lock_hash_hex = None;
+    }
+    if !matches!(prefs.privacy_mode.as_str(), "off" | "privacy" | "black") {
+        prefs.privacy_mode = default_privacy_mode();
+    }
+    if !matches!(
+        prefs.privacy_preset.as_str(),
+        "preset-1" | "preset-2" | "preset-3" | "preset-4" | "preset-5" | "preset-6" | "custom"
+    ) {
+        prefs.privacy_preset = default_privacy_preset();
+    }
+    if let Some(ref custom_file) = prefs.privacy_custom_image {
+        let mut comps = Path::new(custom_file).components();
+        let safe = matches!(
+            (comps.next(), comps.next()),
+            (Some(Component::Normal(_)), None)
+        ) && custom_file.len() <= 64;
+        if !safe {
+            prefs.privacy_custom_image = None;
+        }
+    }
+    if !matches!(prefs.mouse_mode.as_str(), "smart" | "remote" | "local") {
+        prefs.mouse_mode = default_mouse_mode();
+    }
+    prefs.update_mirror_url =
+        crate::updater::sanitize_update_mirror_url(&prefs.update_mirror_url).unwrap_or_default();
+    prefs.file_transfer_dir = prefs
+        .file_transfer_dir
+        .as_deref()
+        .and_then(|raw| sanitize_file_transfer_dir(raw).ok().flatten());
+    let mut clean_exc = Vec::with_capacity(prefs.shortcut_exceptions.len().min(32));
+    for item in &prefs.shortcut_exceptions {
+        let t = item.trim();
+        if !t.is_empty()
+            && t.chars().count() <= 32
+            && !t.chars().any(char::is_control)
+            && !clean_exc.iter().any(|x| x == t)
+        {
+            clean_exc.push(t.to_string());
+            if clean_exc.len() >= 32 {
+                break;
+            }
+        }
+    }
+    prefs.shortcut_exceptions = clean_exc;
+}
+
+/// 从指定路径读取应用偏好设置；文件不存在或内容损坏时回退默认值，并对越界字段自动修正。
+pub fn load_from_path(path: &Path) -> AppPrefs {
+    let Ok(bytes) = fs::read(path) else {
+        return AppPrefs::default();
+    };
+    let Ok(mut prefs) = serde_json::from_slice::<AppPrefs>(&bytes) else {
+        return AppPrefs::default();
+    };
+    sanitize_prefs(&mut prefs);
+    prefs
+}
+
+pub(crate) fn atomic_write_bytes(
+    path: &Path,
+    bytes: &[u8],
+    append_newline: bool,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("创建目录 {} 失败：{e}", parent.display()))?;
+        }
+    }
+
+    let mut rand_suffix = [0u8; 6];
+    OsRng.fill_bytes(&mut rand_suffix);
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("prefs.tmp");
+    let tmp_name = format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        encode_hex_lower(&rand_suffix)
+    );
+    let tmp_path = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+        _ => PathBuf::from(tmp_name),
+    };
+
+    #[cfg(unix)]
+    let mode = crate::config_paths::file_mode_for(path);
+    let write_res = (|| -> std::io::Result<()> {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(mode);
+        }
+        let mut file = opts.open(&tmp_path)?;
+        file.write_all(bytes)?;
+        if append_newline {
+            file.write_all(b"\n")?;
+        }
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(mode));
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("写入临时文件失败：{err}"));
+    }
+
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("原子替换文件 {} 失败：{err}", path.display()));
+    }
+
+    Ok(())
+}
+
+/// 将应用偏好原子写入指定路径（先写同目录临时文件并落盘，再 `rename` 覆盖）。
+///
+/// 会自动创建缺失的父目录；在 Unix 平台上将文件权限收紧为 `0600`。
+pub fn save_to_path(path: &Path, prefs: &AppPrefs) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(prefs).map_err(|e| format!("序列化应用偏好失败：{e}"))?;
+    atomic_write_bytes(path, &json, true)
+}
+
+fn sanitize_device_key_for_filename(device_key: &str) -> String {
+    let mut cleaned = String::with_capacity(device_key.len().min(64));
+    let mut prev_underscore = false;
+    for ch in device_key.trim().chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            cleaned.push(ch);
+            prev_underscore = ch == '_';
+        } else if !prev_underscore && !cleaned.is_empty() {
+            cleaned.push('_');
+            prev_underscore = true;
+        }
+        if cleaned.len() >= 64 {
+            break;
+        }
+    }
+    let trimmed = cleaned.trim_matches('_');
+    if trimmed.is_empty() {
+        "device".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn is_safe_wallpaper_filename(filename: &str) -> bool {
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+        || filename.contains('\0')
+    {
+        return false;
+    }
+    let mut components = Path::new(filename).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+/// 将远端桌面壁纸 JPEG 字节原子写入 `wallpapers_dir`，返回安全文件名（如 `192_168_1_10_9901.jpg`）。
+///
+/// 拒绝空载荷及超过 `96 KiB`（[`MAX_WALLPAPER_BYTES`]）的图像，并清洗 `device_key` 防止路径穿越。
+pub fn save_device_wallpaper(
+    wallpapers_dir: &Path,
+    device_key: &str,
+    jpeg_bytes: &[u8],
+) -> Result<String, String> {
+    if jpeg_bytes.is_empty() {
+        return Err("壁纸数据不能为空".to_string());
+    }
+    if jpeg_bytes.len() > MAX_WALLPAPER_BYTES {
+        return Err(format!(
+            "壁纸体积超限：{} 字节（上限 {} 字节）",
+            jpeg_bytes.len(),
+            MAX_WALLPAPER_BYTES
+        ));
+    }
+
+    let safe_stem = sanitize_device_key_for_filename(device_key);
+    let filename = format!("{safe_stem}.jpg");
+    if !is_safe_wallpaper_filename(&filename) {
+        return Err("生成安全壁纸文件名失败".to_string());
+    }
+
+    let dest = wallpapers_dir.join(&filename);
+    atomic_write_bytes(&dest, jpeg_bytes, false)?;
+    Ok(filename)
+}
+
+/// 从 `wallpapers_dir` 读取指定壁纸文件并编码为 `data:image/jpeg;base64,...`；
+/// 文件名非法（含 `/`、`\`、`..`）、文件不存在或超限时返回 `None`。
+pub fn load_device_wallpaper_data_url(wallpapers_dir: &Path, filename: &str) -> Option<String> {
+    if !is_safe_wallpaper_filename(filename) {
+        return None;
+    }
+    let path = wallpapers_dir.join(filename);
+    let bytes = fs::read(&path).ok()?;
+    if bytes.is_empty() || bytes.len() > MAX_WALLPAPER_BYTES {
+        return None;
+    }
+    let b64 = base64_encode(&bytes);
+    Some(format!("data:image/jpeg;base64,{b64}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_test_dir(tag: &str) -> PathBuf {
+        let mut suffix = [0u8; 6];
+        OsRng.fill_bytes(&mut suffix);
+        std::env::temp_dir().join(format!("rc-ui-{tag}-{}", encode_hex_lower(&suffix)))
+    }
+
+    #[test]
+    fn default_paths_and_prefs_match_spec() {
+        let base = crate::config_paths::config_dir();
+        let prefs_path = default_prefs_path();
+        assert_eq!(prefs_path, base.join("prefs.json"));
+        let wp_dir = default_wallpapers_dir();
+        assert_eq!(wp_dir, base.join("wallpapers"));
+        assert!(crate::config_paths::user_config_dir().ends_with(".config/rabbitcontrol"));
+
+        let prefs = AppPrefs::default();
+        assert!(!prefs.allow_remote_assist);
+        assert_eq!(prefs.bitrate_preset, "14m");
+        assert_eq!(prefs.bitrate_bps, 14_000_000);
+        assert_eq!(prefs.fps, 144);
+        assert_eq!(prefs.resolution_width, None);
+        assert_eq!(prefs.resolution_height, None);
+        assert!(prefs.show_hud);
+        assert!(prefs.device_snapshots.is_empty());
+
+        let json_val = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(json_val["allowRemoteAssist"], false);
+        assert_eq!(json_val["bitratePreset"], "14m");
+        assert_eq!(json_val["bitrateBps"], 14_000_000);
+        assert_eq!(json_val["fps"], 144);
+        assert!(json_val["resolutionWidth"].is_null());
+        assert!(json_val["resolutionHeight"].is_null());
+        assert_eq!(json_val["showHud"], true);
+        assert_eq!(json_val["deviceSnapshots"], serde_json::json!({}));
+
+        // 空 JSON `{}` 反序列化必须恢复各项非零默认值
+        let parsed_empty: AppPrefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed_empty, AppPrefs::default());
+    }
+
+    #[test]
+    fn apply_stream_patch_validates_all_fields_atomically() {
+        let mut prefs = AppPrefs::default();
+
+        // 合法修改
+        prefs
+            .apply_stream_patch(StreamPrefsPatch {
+                bitrate_preset: Some("30m".to_string()),
+                bitrate_bps: Some(30_000_000),
+                fps: Some(120),
+                resolution_width: Some(1920),
+                resolution_height: Some(1080),
+                clear_resolution: None,
+                show_hud: Some(false),
+                lock_on_exit: Some(true),
+            })
+            .expect("valid patch");
+        assert_eq!(prefs.bitrate_preset, "30m");
+        assert_eq!(prefs.bitrate_bps, 30_000_000);
+        assert_eq!(prefs.fps, 120);
+        assert_eq!(prefs.resolution_width, Some(1920));
+        assert_eq!(prefs.resolution_height, Some(1080));
+        assert!(!prefs.show_hud);
+        assert!(prefs.lock_on_exit);
+
+        // 清除分辨率
+        prefs
+            .apply_stream_patch(StreamPrefsPatch {
+                clear_resolution: Some(true),
+                ..Default::default()
+            })
+            .expect("clear resolution");
+        assert_eq!(prefs.resolution_width, None);
+        assert_eq!(prefs.resolution_height, None);
+
+        // 非法补丁不得部分修改状态
+        let snapshot_before = prefs.clone();
+        for bad in [
+            StreamPrefsPatch {
+                bitrate_preset: Some("999m".to_string()),
+                fps: Some(60),
+                ..Default::default()
+            },
+            StreamPrefsPatch {
+                bitrate_bps: Some(500_000),
+                ..Default::default()
+            },
+            StreamPrefsPatch {
+                bitrate_bps: Some(150_000_001),
+                ..Default::default()
+            },
+            StreamPrefsPatch {
+                fps: Some(14),
+                ..Default::default()
+            },
+            StreamPrefsPatch {
+                fps: Some(381),
+                ..Default::default()
+            },
+            StreamPrefsPatch {
+                resolution_width: Some(318),
+                resolution_height: Some(240),
+                ..Default::default()
+            },
+            StreamPrefsPatch {
+                resolution_width: Some(640),
+                resolution_height: Some(238),
+                ..Default::default()
+            },
+            StreamPrefsPatch {
+                resolution_width: Some(1280),
+                resolution_height: None,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                prefs.apply_stream_patch(bad).is_err(),
+                "expected validation error"
+            );
+            assert_eq!(prefs, snapshot_before);
+        }
+    }
+
+    #[test]
+    fn load_and_save_prefs_atomic_roundtrip_and_sanitization() {
+        let dir = temp_test_dir("app-prefs");
+        let path = dir.join("nested").join("prefs.json");
+
+        // 缺失文件回退默认值
+        assert_eq!(load_from_path(&path), AppPrefs::default());
+
+        let mut prefs = AppPrefs {
+            allow_remote_assist: true,
+            custom_host_password: Some("MYCODE".to_string()),
+            bitrate_preset: "8m".to_string(),
+            bitrate_bps: 8_000_000,
+            fps: 60,
+            resolution_width: Some(1512),
+            resolution_height: Some(982),
+            show_hud: false,
+            lock_on_exit: true,
+            default_encrypt_connection: false,
+            show_lan_devices: true,
+            close_to_tray: false,
+            device_snapshots: BTreeMap::new(),
+            saved_portmaps: BTreeMap::new(),
+            ..AppPrefs::default()
+        };
+        prefs.device_snapshots.insert(
+            "604928235".to_string(),
+            DeviceSnapshotRecord {
+                name: "Studio Mac".to_string(),
+                last_connected_ts: 1_732_000_000,
+                wallpaper_file: Some("604928235.jpg".to_string()),
+            },
+        );
+
+        save_to_path(&path, &prefs).expect("save prefs");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        assert_eq!(load_from_path(&path), prefs);
+
+        // 越界字段与非法壁纸文件名在读取时被清洗
+        let tainted = serde_json::json!({
+            "allowRemoteAssist": true,
+            "bitratePreset": "invalid",
+            "bitrateBps": 123,
+            "fps": 999,
+            "resolutionWidth": 100,
+            "resolutionHeight": 100,
+            "showHud": false,
+            "deviceSnapshots": {
+                "evil": {
+                    "name": "Evil",
+                    "lastConnectedTs": 42,
+                    "wallpaperFile": "../secret.jpg"
+                }
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&tainted).unwrap()).unwrap();
+        let cleaned = load_from_path(&path);
+        assert!(cleaned.allow_remote_assist);
+        assert_eq!(cleaned.bitrate_preset, DEFAULT_BITRATE_PRESET);
+        assert_eq!(cleaned.bitrate_bps, DEFAULT_BITRATE_BPS);
+        assert_eq!(cleaned.fps, DEFAULT_FPS);
+        assert_eq!(cleaned.resolution_width, None);
+        assert_eq!(cleaned.resolution_height, None);
+        assert!(!cleaned.show_hud);
+        assert!(!cleaned.lock_on_exit);
+        assert_eq!(cleaned.device_snapshots["evil"].wallpaper_file, None);
+
+        // 损坏 JSON 安全回退默认
+        fs::write(&path, b"{corrupt").unwrap();
+        assert_eq!(load_from_path(&path), AppPrefs::default());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn device_wallpaper_save_load_sanitizes_and_enforces_limits() {
+        let dir = temp_test_dir("wallpapers");
+        let wp_dir = dir.join("wallpapers");
+        let jpeg = vec![0xFFu8, 0xD8, 0xFF, 0xE0, 0x01, 0x02, 0x03];
+
+        // 拒绝空与超大载荷
+        assert!(save_device_wallpaper(&wp_dir, "dev1", &[]).is_err());
+        let oversized = vec![0xABu8; MAX_WALLPAPER_BYTES + 1];
+        assert!(save_device_wallpaper(&wp_dir, "dev1", &oversized).is_err());
+
+        // 清洗危险设备键为安全文件名
+        let file1 = save_device_wallpaper(&wp_dir, "../../192.168.1.10:9901", &jpeg)
+            .expect("save sanitized wallpaper");
+        assert!(!file1.contains('/'));
+        assert!(!file1.contains('\\'));
+        assert!(!file1.contains(".."));
+        assert!(file1.ends_with(".jpg"));
+
+        let data_url = load_device_wallpaper_data_url(&wp_dir, &file1).expect("load data url");
+        assert_eq!(
+            data_url,
+            format!("data:image/jpeg;base64,{}", base64_encode(&jpeg))
+        );
+
+        // 路径穿越文件名全部拒绝
+        for bad_name in [
+            "",
+            "../a.jpg",
+            "sub/a.jpg",
+            "sub\\a.jpg",
+            "a..b.jpg",
+            "missing.jpg",
+        ] {
+            assert_eq!(
+                load_device_wallpaper_data_url(&wp_dir, bad_name),
+                None,
+                "expected None for {bad_name:?}"
+            );
+        }
+
+        // DeviceSnapshotView 序列化字段名校验
+        let mut prefs = AppPrefs::default();
+        prefs.device_snapshots.insert(
+            "192.168.1.10:9901".to_string(),
+            DeviceSnapshotRecord {
+                name: "MacBook Pro".to_string(),
+                last_connected_ts: 123456,
+                wallpaper_file: Some(file1),
+            },
+        );
+        let views = prefs.snapshot_views(&wp_dir);
+        assert_eq!(views.len(), 1);
+        let v = serde_json::to_value(&views[0]).unwrap();
+        assert_eq!(v["key"], "192.168.1.10:9901");
+        assert_eq!(v["name"], "MacBook Pro");
+        assert_eq!(v["lastConnectedTs"], 123456);
+        assert_eq!(v["wallpaperDataUrl"], data_url);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn security_prefs_defaults_and_patch_validation() {
+        let mut prefs = AppPrefs::default();
+        assert_eq!(prefs.default_encrypt_connection, DEFAULT_ENCRYPT_CONNECTION);
+        assert!(prefs.default_encrypt_connection);
+        assert!(!prefs.show_lan_devices);
+
+        let json_val = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(json_val["defaultEncryptConnection"], true);
+        assert_eq!(json_val["showLanDevices"], false);
+
+        // 旧版配置含 allowOwnerSelfControl: false 也能兼容加载且不影响当前配置
+        let legacy: AppPrefs = serde_json::from_value(serde_json::json!({
+            "allowOwnerSelfControl": false,
+            "allowRemoteAssist": false
+        }))
+        .expect("legacy prefs with allowOwnerSelfControl should deserialize");
+        assert!(!legacy.allow_remote_assist);
+        assert!(legacy.default_encrypt_connection);
+
+        // 合法更新
+        prefs
+            .apply_security_patch(SecurityPrefsPatch {
+                allow_remote_assist: Some(true),
+                default_encrypt_connection: Some(false),
+                show_lan_devices: Some(true),
+                custom_host_password: Some("PIN99".to_string()),
+                clear_custom_host_password: None,
+            })
+            .expect("valid security patch");
+        assert!(prefs.allow_remote_assist);
+        assert!(!prefs.default_encrypt_connection);
+        assert!(prefs.show_lan_devices);
+        assert_eq!(prefs.custom_host_password.as_deref(), Some("PIN99"));
+
+        // 清除密码
+        prefs
+            .apply_security_patch(SecurityPrefsPatch {
+                clear_custom_host_password: Some(true),
+                ..Default::default()
+            })
+            .expect("clear custom password");
+        assert_eq!(prefs.custom_host_password, None);
+
+        // 非法密码不得部分修改其他字段
+        let snapshot_before = prefs.clone();
+        for bad_pw in ["a".repeat(65), "bad\npw".to_string(), "bad\0pw".to_string()] {
+            assert!(prefs
+                .apply_security_patch(SecurityPrefsPatch {
+                    show_lan_devices: Some(false),
+                    custom_host_password: Some(bad_pw),
+                    ..Default::default()
+                })
+                .is_err());
+            assert_eq!(prefs, snapshot_before);
+        }
+    }
+
+    #[test]
+    fn saved_portmaps_roundtrip_and_limits() {
+        let dir = temp_test_dir("portmaps");
+        let path = dir.join("prefs.json");
+        let mut prefs = AppPrefs::default();
+        prefs.set_device_portmaps(
+            "dev-1",
+            vec![
+                SavedPortMapRule {
+                    name: "SSH".to_string(),
+                    local_port: 2222,
+                    target_addr: "127.0.0.1".to_string(),
+                    target_port: 22,
+                    enabled: true,
+                },
+                SavedPortMapRule {
+                    name: String::new(),
+                    local_port: 0,
+                    target_addr: "127.0.0.1".to_string(),
+                    target_port: 80,
+                    enabled: true,
+                },
+            ],
+        );
+        save_to_path(&path, &prefs).unwrap();
+        let loaded = load_from_path(&path);
+        let list = loaded.saved_portmaps.get("dev-1").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "SSH");
+        assert_eq!(list[0].local_port, 2222);
+
+        let mut cleared = loaded;
+        cleared.set_device_portmaps("dev-1", Vec::new());
+        assert!(!cleared.saved_portmaps.contains_key("dev-1"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn close_to_tray_defaults_true_and_roundtrips() {
+        let dir = temp_test_dir("close-tray");
+        let path = dir.join("prefs.json");
+        let def = AppPrefs::default();
+        assert!(def.close_to_tray);
+
+        // 旧版 JSON 不含 closeToTray 字段时应兼容反序列化为 true。
+        let legacy: AppPrefs = serde_json::from_str(r#"{"showHud":true}"#).unwrap();
+        assert!(legacy.close_to_tray);
+
+        let mut custom = def;
+        custom.close_to_tray = false;
+        save_to_path(&path, &custom).unwrap();
+        let reloaded = load_from_path(&path);
+        assert!(!reloaded.close_to_tray);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_transfer_dir_sanitization_defaults_and_persistence() {
+        let dir = temp_test_dir("ft-dir-prefs");
+        let path = dir.join("prefs.json");
+
+        // 1) Default path & methods
+        let default_dir = default_file_transfer_dir();
+        #[cfg(target_os = "macos")]
+        assert!(default_dir.ends_with("Library/Application Support/RabbitControl/Download"));
+        #[cfg(not(target_os = "macos"))]
+        assert!(
+            default_dir.ends_with("Downloads/RabbitControl") || default_dir.ends_with("Download")
+        );
+
+        let mut prefs = AppPrefs::default();
+        assert_eq!(prefs.file_transfer_dir, None);
+        assert!(prefs.is_default_file_transfer_dir());
+        assert_eq!(prefs.resolved_file_transfer_dir(), default_dir);
+
+        // 2) Sanitization: empty -> None, trailing slash normalized, root preserved, ~ expanded
+        assert_eq!(sanitize_file_transfer_dir("   ").unwrap(), None);
+        let custom_dir = dir.join("custom_downloads");
+        let with_trailing = format!("{}/", custom_dir.to_string_lossy());
+        assert_eq!(
+            sanitize_file_transfer_dir(&with_trailing).unwrap(),
+            Some(custom_dir.to_string_lossy().into_owned())
+        );
+
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                sanitize_file_transfer_dir("/").unwrap(),
+                Some("/".to_string())
+            );
+            assert_eq!(
+                sanitize_file_transfer_dir("///").unwrap(),
+                Some("/".to_string())
+            );
+        }
+
+        if user_home_dir().is_some() {
+            let expanded_tilde = sanitize_file_transfer_dir("~/Downloads/").unwrap().unwrap();
+            assert!(Path::new(&expanded_tilde).is_absolute());
+            assert!(!expanded_tilde.ends_with('/'));
+            let expanded_home = sanitize_file_transfer_dir("~").unwrap().unwrap();
+            assert!(Path::new(&expanded_home).is_absolute());
+        }
+
+        // Reject relative paths, NUL, ASCII/Unicode control chars, `..` traversal, and `~//abs` escape
+        assert!(sanitize_file_transfer_dir("relative/path").is_err());
+        assert!(sanitize_file_transfer_dir("./local").is_err());
+        assert!(sanitize_file_transfer_dir("~//etc").is_err());
+        assert!(sanitize_file_transfer_dir("~/\\etc").is_err());
+        assert!(sanitize_file_transfer_dir("~/../../etc").is_err());
+        let traversal = format!("{}/../../etc", custom_dir.to_string_lossy());
+        assert!(sanitize_file_transfer_dir(&traversal).is_err());
+        let bad_nul = format!("{}\0evil", custom_dir.to_string_lossy());
+        assert!(sanitize_file_transfer_dir(&bad_nul).is_err());
+        let bad_ctrl = format!("{}\nline", custom_dir.to_string_lossy());
+        assert!(sanitize_file_transfer_dir(&bad_ctrl).is_err());
+        let bad_del = format!("{}\x7fdel", custom_dir.to_string_lossy());
+        assert!(sanitize_file_transfer_dir(&bad_del).is_err());
+        let bad_c1 = format!("{}\u{0085}nel", custom_dir.to_string_lossy());
+        assert!(sanitize_file_transfer_dir(&bad_c1).is_err());
+
+        // Windows root preservation helper checks (drive root, verbatim root, UNC share root)
+        let mut win_drive = String::from("C:\\");
+        trim_trailing_separators(&mut win_drive, true);
+        assert_eq!(win_drive, "C:\\");
+        let mut win_verbatim = String::from("\\\\?\\C:\\");
+        trim_trailing_separators(&mut win_verbatim, true);
+        assert_eq!(win_verbatim, "\\\\?\\C:\\");
+        let mut win_verbatim_sub = String::from("\\\\?\\C:\\Downloads\\\\");
+        trim_trailing_separators(&mut win_verbatim_sub, true);
+        assert_eq!(win_verbatim_sub, "\\\\?\\C:\\Downloads");
+        let mut win_unc_root = String::from("\\\\server\\share\\");
+        trim_trailing_separators(&mut win_unc_root, true);
+        assert_eq!(win_unc_root, "\\\\server\\share\\");
+        let mut win_unc_sub = String::from("\\\\server\\share\\folder\\\\");
+        trim_trailing_separators(&mut win_unc_sub, true);
+        assert_eq!(win_unc_sub, "\\\\server\\share\\folder");
+
+        // 3) apply_file_transfer_dir + persistence roundtrip
+        let applied = prefs
+            .apply_file_transfer_dir(Some(with_trailing))
+            .expect("apply custom dir");
+        assert_eq!(applied, custom_dir);
+        assert!(!prefs.is_default_file_transfer_dir());
+        assert_eq!(prefs.resolved_file_transfer_dir(), custom_dir);
+
+        save_to_path(&path, &prefs).expect("save prefs with file_transfer_dir");
+        let reloaded = load_from_path(&path);
+        assert_eq!(reloaded.file_transfer_dir, prefs.file_transfer_dir);
+        assert_eq!(reloaded.resolved_file_transfer_dir(), custom_dir);
+
+        // Reset back to default via empty string
+        let reset = prefs
+            .apply_file_transfer_dir(Some(String::new()))
+            .expect("reset default");
+        assert_eq!(reset, default_dir);
+        assert_eq!(prefs.file_transfer_dir, None);
+        assert!(prefs.is_default_file_transfer_dir());
+
+        // 4) Invalid disk value silently resets to None in sanitize_prefs
+        let tainted = serde_json::json!({
+            "fileTransferDir": "relative/not-allowed"
+        });
+        fs::write(&path, serde_json::to_vec(&tainted).unwrap()).unwrap();
+        let cleaned = load_from_path(&path);
+        assert_eq!(cleaned.file_transfer_dir, None);
+        assert!(cleaned.is_default_file_transfer_dir());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connection_mode_and_upnp_enabled_defaults_and_legacy_compat() {
+        assert_eq!(ConnectionMode::default(), ConnectionMode::Auto);
+        assert_eq!(ConnectionMode::Auto.as_str(), "auto");
+        assert_eq!(ConnectionMode::P2pOnly.as_str(), "p2p_only");
+        assert_eq!(ConnectionMode::TcpRelay.as_str(), "tcp_relay");
+
+        assert_eq!(
+            ConnectionMode::parse_lossy("auto"),
+            Some(ConnectionMode::Auto)
+        );
+        assert_eq!(
+            ConnectionMode::parse_lossy(" AUTO "),
+            Some(ConnectionMode::Auto)
+        );
+        assert_eq!(
+            ConnectionMode::parse_lossy("p2p_only"),
+            Some(ConnectionMode::P2pOnly)
+        );
+        assert_eq!(
+            ConnectionMode::parse_lossy("P2P-ONLY"),
+            Some(ConnectionMode::P2pOnly)
+        );
+        assert_eq!(
+            ConnectionMode::parse_lossy("p2p"),
+            Some(ConnectionMode::P2pOnly)
+        );
+        assert_eq!(
+            ConnectionMode::parse_lossy("tcp_relay"),
+            Some(ConnectionMode::TcpRelay)
+        );
+        assert_eq!(
+            ConnectionMode::parse_lossy("TCP-Relay"),
+            Some(ConnectionMode::TcpRelay)
+        );
+        assert_eq!(
+            ConnectionMode::parse_lossy("relay"),
+            Some(ConnectionMode::TcpRelay)
+        );
+        assert_eq!(ConnectionMode::parse_lossy(""), None);
+        assert_eq!(ConnectionMode::parse_lossy("direct_magic"), None);
+
+        let def = AppPrefs::default();
+        assert_eq!(def.connection_mode, ConnectionMode::Auto);
+        assert!(def.upnp_enabled);
+        let json_val = serde_json::to_value(&def).unwrap();
+        assert_eq!(json_val["connectionMode"], "auto");
+        assert_eq!(json_val["upnpEnabled"], true);
+
+        // 旧版 prefs.json 缺少 connectionMode 与 upnpEnabled 字段时应回退安全默认值。
+        let legacy: AppPrefs = serde_json::from_str(
+            r#"{"allowRemoteAssist":true,"bitratePreset":"30m","bitrateBps":30000000,"fps":120}"#,
+        )
+        .expect("legacy prefs without connectionMode/upnpEnabled");
+        assert_eq!(legacy.connection_mode, ConnectionMode::Auto);
+        assert!(legacy.upnp_enabled);
+
+        let dir = temp_test_dir("conn-mode-upnp");
+        let path = dir.join("prefs.json");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, br#"{"showHud":false}"#).unwrap();
+        let loaded_legacy = load_from_path(&path);
+        assert_eq!(loaded_legacy.connection_mode, ConnectionMode::Auto);
+        assert!(loaded_legacy.upnp_enabled);
+        assert!(!loaded_legacy.show_hud);
+
+        for mode in [ConnectionMode::P2pOnly, ConnectionMode::TcpRelay] {
+            let custom = AppPrefs {
+                connection_mode: mode,
+                upnp_enabled: false,
+                ..AppPrefs::default()
+            };
+            save_to_path(&path, &custom).unwrap();
+            let reloaded = load_from_path(&path);
+            assert_eq!(reloaded.connection_mode, mode);
+            assert!(!reloaded.upnp_enabled);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allow_assist_file_transfer_defaults_true_and_roundtrips() {
+        let def = AppPrefs::default();
+        assert!(def.allow_assist_file_transfer);
+        let json_val = serde_json::to_value(&def).unwrap();
+        assert_eq!(json_val["allowAssistFileTransfer"], true);
+
+        // 旧版 prefs.json 缺少 allowAssistFileTransfer 时默认兼容为 true。
+        let legacy: AppPrefs = serde_json::from_str(r#"{"allowRemoteAssist":true}"#)
+            .expect("legacy prefs without allowAssistFileTransfer");
+        assert!(legacy.allow_assist_file_transfer);
+
+        let dir = temp_test_dir("assist-file-transfer");
+        let path = dir.join("prefs.json");
+        fs::create_dir_all(&dir).unwrap();
+        let custom = AppPrefs {
+            allow_assist_file_transfer: false,
+            ..AppPrefs::default()
+        };
+        save_to_path(&path, &custom).unwrap();
+        let reloaded = load_from_path(&path);
+        assert!(!reloaded.allow_assist_file_transfer);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn still_refinement_enabled_defaults_true_and_legacy_compat() {
+        let def = AppPrefs::default();
+        assert!(def.still_refinement_enabled);
+        let json_val = serde_json::to_value(&def).unwrap();
+        assert_eq!(json_val["stillRefinementEnabled"], true);
+
+        // 旧版配置缺失 stillRefinementEnabled 时默认兼容为 true。
+        let legacy: AppPrefs = serde_json::from_str(r#"{"showHud":false}"#)
+            .expect("legacy prefs without stillRefinementEnabled");
+        assert!(legacy.still_refinement_enabled);
+        assert!(!legacy.show_hud);
+
+        let dir = temp_test_dir("still-refinement");
+        let path = dir.join("prefs.json");
+        fs::create_dir_all(&dir).unwrap();
+        let custom = AppPrefs {
+            still_refinement_enabled: false,
+            ..AppPrefs::default()
+        };
+        save_to_path(&path, &custom).unwrap();
+        let reloaded = load_from_path(&path);
+        assert!(!reloaded.still_refinement_enabled);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

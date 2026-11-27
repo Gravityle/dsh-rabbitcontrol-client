@@ -11,6 +11,7 @@
 //! 里程碑 1 的验证目标：`rc-cli host --backend fake` 当被控端，本进程能连上
 //! 并吐出真实帧；用 `--out frames.rcb` 落盘后可离线解析 NAL 类型。
 
+mod auto_transport;
 mod clip;
 mod host;
 mod identity;
@@ -103,7 +104,7 @@ struct Args {
         /// 信令被控端的内容来源：clip（回放片段，跨平台）| real（真实屏幕，仅 macOS 且带 real-capture 特性）。
     #[arg(long, default_value = "clip")]
     source: String,
-    /// 传输偏好：auto（先打洞、失败走中继）| p2p（只用打洞）| relay（只用中继）。
+    /// 传输偏好：auto（中继优先、后台升级直连）| p2p（只用打洞）| relay（只用中继）。
     #[arg(long, default_value = "auto")]
     transport: String,
     /// 信令被控端：总运行时长（等连接 + 服务会话）。

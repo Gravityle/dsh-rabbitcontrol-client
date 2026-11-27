@@ -9,16 +9,16 @@ description = "RabbitControl 控制端边车：连上被控端，把编码后的
 
 [dependencies]
 # 与 rabbitcontrol-macos 使用同一 tag，保证协议一致。
-rc-types = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.3" }
-rc-capture = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.3" }
-rc-client-core = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.3" }
-rc-encode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.3" }
-rc-input = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.3" }
-rc-decode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.3" }
-rc-render = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.3" }
-rc-pipeline = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.3" }
-rc-net = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.3" }
-rc-session = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.3" }
+rc-types = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-capture = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-client-core = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-encode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-input = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-decode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-render = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-pipeline = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-net = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
+rc-session = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.2.5" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 
@@ -30,11 +30,11 @@ incremental = false
 
 # 真实采集/编码（ScreenCaptureKit + VideoToolbox）只用于 macOS，且是可选项：
 # Windows 构建不带这个 feature，因此不会拉进任何 macOS 专用代码。
-# rabbitcontrol-macos v0.2.2 与本项目同样依赖 core v0.2.3，Apple Media 随锁文件固定。
+# macOS 0.2.4 release commit（上游尚无同名 tag）与 Core v0.2.5；Apple Media v0.2.3 由上游及锁文件固定。
 [target.'cfg(target_os = "macos")'.dependencies]
-rc-platform-macos = { git = "https://github.com/TokenBoom/rabbitcontrol-macos.git", tag = "v0.2.2", optional = true }
+rc-platform-macos = { git = "https://github.com/TokenBoom/rabbitcontrol-macos.git", rev = "65d4c8a53b96a96eecb3c9abb223cf9111abf954", optional = true }
 # 真实输入注入（CGEvent）：被控端要把对端的鼠标键盘真正敲进本机，需要它。
-rc-input-macos = { git = "https://github.com/TokenBoom/rabbitcontrol-macos.git", tag = "v0.2.2", optional = true }
+rc-input-macos = { git = "https://github.com/TokenBoom/rabbitcontrol-macos.git", rev = "65d4c8a53b96a96eecb3c9abb223cf9111abf954", optional = true }
 
 [features]
 real-capture = ["dep:rc-platform-macos", "dep:rc-input-macos"]
@@ -42,3 +42,7 @@ real-capture = ["dep:rc-platform-macos", "dep:rc-input-macos"]
 [profile.release]
 # 发布用：剥掉符号表，避免把编译机路径写进发布物。
 strip = "symbols"
+
+# Expose upstream existing probe-port ownership API for the external sidecar.
+[patch."https://github.com/TokenBoom/rabbitcontrol-core.git"]
+rc-client-core = { path = "vendor/rc-client-core" }

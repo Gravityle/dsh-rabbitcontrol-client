@@ -442,6 +442,7 @@ async function routeHandler(ctx, req, res) {
   child.stdout.on('error', stop)
   child.stderr.setEncoding('utf8')
   let partialLine = ''
+  let explicitRoutes = false
   child.stderr.on('data', text => {
     stderrTail = (stderrTail + text).slice(-2000)
     const lines = (partialLine + text).split('\n')
@@ -450,8 +451,15 @@ async function routeHandler(ctx, req, res) {
       if (!line.trim()) continue
       console.log(`[rabbitcontrol-client] bridge: ${line.trim()}`)
       if (!parsed.signal) continue
-      if (line.includes('打洞成功')) pendingRoute = 'p2p'
-      else if (line.includes('→ 中继')) pendingRoute = 'relay'
+      const committed = /\brc-bridge route=(p2p|relay)\b/.exec(line)
+      if (committed) {
+        explicitRoutes = true
+        pendingRoute = committed[1]
+      } else if (!explicitRoutes) {
+        // 兼容旧边车。新边车先发明确的初始路径，后台候选不改变徽标。
+        if (line.includes('打洞成功')) pendingRoute = 'p2p'
+        else if (line.includes('→ 中继')) pendingRoute = 'relay'
+      }
     }
   })
   res.once('close', () => { if (active?.child === child) stop() })

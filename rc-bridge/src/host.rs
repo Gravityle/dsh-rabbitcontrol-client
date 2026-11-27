@@ -327,7 +327,7 @@ pub fn run_signaling_host(options: &SignalHostOptions) -> Result<(), String> {
             expected_peer_device_id: Some(incoming.peer_id.clone()),
             expected_peer_user_id: Some(identity.user_id.clone()),
         };
-        let transport = match choose_host_transport(options.transport, &incoming, &mtls) {
+        let (transport, active_switch) = match choose_host_transport(options.transport, &incoming, &mtls) {
             Ok(transport) => transport,
             Err(error) => {
                 eprintln!("rc-bridge 信令被控端：建链失败（继续等待下一次请求）：{error}");
@@ -342,7 +342,7 @@ pub fn run_signaling_host(options: &SignalHostOptions) -> Result<(), String> {
             collect_requests(&mut pending, || handle.try_recv_incoming(), &recent);
             pending.iter().any(|next| next.peer_id == incoming.peer_id)
         };
-        match serve_over(options, bytes.clone(), transport, auth.clone(), &mut stop) {
+        match serve_over(options, bytes.clone(), transport, active_switch, auth.clone(), &mut stop) {
             Ok(()) => {
                 served += 1;
                 eprintln!("rc-bridge 信令被控端：第 {served} 次会话结束，继续等下一个连接");
@@ -384,7 +384,7 @@ fn choose_host_transport(
     choice: crate::TransportChoice,
     incoming: &rc_client_core::signal_client::RelayIncoming,
     mtls: &rc_client_core::relay_transport::SessionMtlsBundle,
-) -> Result<Box<dyn rc_net::Transport>, String> {
+) -> Result<(Box<dyn rc_net::Transport>, Option<crate::auto_transport::ActiveSwitch>), String> {
     use crate::p2p;
     use crate::relay;
     use rc_client_core::p2p::P2pCandidates;
@@ -406,7 +406,8 @@ fn choose_host_transport(
         return Err("对端要求中继，本端要求 P2P".into());
     }
     if incoming.is_relay_alloc || choice == crate::TransportChoice::Relay {
-        return to_relay("按要求只用中继");
+        eprintln!("rc-bridge route=relay");
+        return to_relay("按要求只用中继").map(|t| (t, None));
     }
     let candidates = P2pCandidates {
         session_id: incoming.session_id.clone(),
@@ -418,14 +419,22 @@ fn choose_host_transport(
         self_nat_port_delta: incoming.self_nat_port_delta,
         peer_nat_type: incoming.peer_nat_type,
         peer_nat_port_delta: incoming.peer_nat_port_delta,
+        self_nat_port_range: incoming.self_nat_port_range,
+        peer_nat_port_range: incoming.peer_nat_port_range,
+        punch_secret: incoming.punch_secret.clone(),
+        start_after_ms: incoming.start_after_ms,
+        relay_fallback_after_ms: incoming.relay_fallback_after_ms,
     };
     let candidates = p2p::filter_candidates(candidates, incoming.self_public_addr.as_deref());
+    if choice == crate::TransportChoice::Auto {
+        return crate::auto_transport::connect(candidates, mtls.clone(), &incoming.relay_addr, &incoming.relay_token, RelayRole::Host);
+    }
     match p2p::punch_host(&candidates, mtls, &p2p::PunchBudget::default()) {
-        Ok(transport) => Ok(transport),
+        Ok(transport) => { eprintln!("rc-bridge route=p2p"); Ok((transport, None)) },
         Err(error) if choice == crate::TransportChoice::P2p => {
             Err(format!("按要求只用打洞，但打洞失败：{error}"))
         }
-        Err(error) => to_relay(&format!("打洞失败（{error}）")),
+        Err(error) => to_relay(&format!("打洞失败（{error}）")).map(|t| (t, None)),
     }
 }
 
@@ -473,6 +482,7 @@ fn serve_over(
     options: &SignalHostOptions,
     bytes: Option<Arc<[u8]>>,
     transport: Box<dyn rc_net::Transport>,
+    active_switch: Option<crate::auto_transport::ActiveSwitch>,
     auth: HostAuthConfig,
     stop: &mut dyn FnMut() -> bool,
 ) -> Result<(), String> {
@@ -560,13 +570,14 @@ fn serve_over(
     while host.state() == rc_session::SessionState::Streaming
         && connected.elapsed() < options.duration && !stop()
     {
+        if let Some(switch) = &active_switch { switch.report(); }
         let report = host.tick(budget).map_err(|e| format!("会话运行失败：{e}"))?;
         if report.closed.is_some() { break; }
         budget = if report.busy { crate::RUN_POLL_BUDGET } else { crate::RUN_IDLE_POLL_BUDGET };
     }
     let summary = host.close(rc_session::proto::ByeReason::Normal).map_err(|e| format!("会话收尾失败：{e}"))?;
-    eprintln!("rc-bridge 信令被控端：会话结束，采集 {} / 编码 {} 帧 / 数据报 {}",
-        summary.captured, summary.frames_encoded, summary.datagrams_sent);
+    eprintln!("rc-bridge 信令被控端：会话结束，采集 {} / 编码 {} 帧 / 数据报 {} / 注入 {}",
+        summary.captured, summary.frames_encoded, summary.datagrams_sent, summary.events_injected);
     Ok(())
 }
 

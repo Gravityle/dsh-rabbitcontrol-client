@@ -382,7 +382,7 @@ pub fn run_signaling_client(
     //
     // 为什么要能跑第二次：家里的网络可能经代理/NAT 出海，打洞会"握手成功但媒体不通"。
     // 那时只看打洞是否报错是不够的，必须看有没有真的收到帧，再决定是否改走中继。
-    let run_over = |transport: Box<dyn rc_net::Transport>, label: &str, grant: &rc_client_core::signal_client::ConnectGrant| -> Result<u64, String> {
+    let run_over = |transport: Box<dyn rc_net::Transport>, active_switch: Option<crate::auto_transport::ActiveSwitch>, label: &str, grant: &rc_client_core::signal_client::ConnectGrant| -> Result<u64, String> {
         let before = sink.lock().expect("帧出口锁").stats().0;
         let session_id = crate::derive_session_id();
         let session_cfg = ClientSessionConfig {
@@ -426,8 +426,14 @@ pub fn run_signaling_client(
             negotiated.width, negotiated.height, negotiated.fps
         );
 
+        let first_video_wait = Instant::now();
         let mut last_busy = true;
         while client.state() != rc_session::SessionState::Closed && t0.elapsed() < duration && !stopped() {
+            // Bound a transport that handshakes but never delivers decodable video.
+            if first_video_wait.elapsed() >= Duration::from_secs(5) && sink.lock().expect("帧出口锁").stats().0 == before {
+                eprintln!("rc-bridge first-video timeout: 5s without an encoded frame");
+                break;
+            }
             match client.state() {
                 rc_session::SessionState::Streaming => {
                     let budget = if last_busy {
@@ -435,6 +441,7 @@ pub fn run_signaling_client(
                     } else {
                         crate::RUN_IDLE_POLL_BUDGET
                     };
+                    if let Some(switch) = &active_switch { switch.report(); }
                     let report = client.tick(budget, Instant::now()).map_err(|e| format!("会话运行失败：{e}"))?;
                     if report.closed.is_some() {
                         break;
@@ -464,6 +471,11 @@ pub fn run_signaling_client(
         self_nat_port_delta: grant.self_nat_port_delta,
         peer_nat_type: grant.peer_nat_type,
         peer_nat_port_delta: grant.peer_nat_port_delta,
+        self_nat_port_range: grant.self_nat_port_range,
+        peer_nat_port_range: grant.peer_nat_port_range,
+        punch_secret: grant.punch_secret.clone(),
+        start_after_ms: grant.start_after_ms,
+        relay_fallback_after_ms: grant.relay_fallback_after_ms,
     }, grant.self_public_addr.as_deref());
     let relay_of = |grant: &rc_client_core::signal_client::ConnectGrant, label: &str| -> Result<Box<dyn rc_net::Transport>, String> {
         eprintln!("rc-bridge 选路：{label} → 中继 {}", grant.relay_addr);
@@ -476,7 +488,23 @@ pub fn run_signaling_client(
         )
     };
 
-    // 第一次尝试：按偏好打洞或直接中继。
+    if transport_choice == crate::TransportChoice::Auto {
+        let (transport, switch) = crate::auto_transport::connect(candidates(), mtls_for(&grant), &grant.relay_addr, &grant.relay_token, RelayRole::Client)?;
+        let before_auto = sink.lock().expect("帧出口锁").stats().0;
+        match run_over(transport, switch, "Relay-first", &grant) {
+            Ok(frames) if frames > 0 || stopped() => return Ok(()),
+            Err(_) if stopped() => return Ok(()),
+            Err(error) if sink.lock().expect("帧出口锁").stats().0 > before_auto => return Err(error),
+            result => eprintln!("rc-bridge auto 首次会话无视频，获取全新中继票据重试：{result:?}"),
+        }
+        let retry = handle.request_relay(&options.target, Duration::from_secs(15))
+            .map_err(|e| format!("auto 中继重试请求失败：{e}"))?;
+        let transport = relay_of(&retry, "auto 无视频重试")?;
+        eprintln!("rc-bridge route=relay");
+        let frames = run_over(transport, None, "auto 中继重试", &retry)?;
+        return if frames > 0 || stopped() { Ok(()) } else { Err("auto 与中继重试都没有交付编码帧".into()) };
+    }
+    // 强制路径保持原有行为。
     let (first, first_route) = if transport_choice == crate::TransportChoice::Relay {
         (relay_of(&grant, "按要求只用中继")?, crate::TransportChoice::Relay)
     } else {
@@ -488,8 +516,9 @@ pub fn run_signaling_client(
             Err(error) => (relay_of(&grant, &format!("打洞失败（{error}）"))?, crate::TransportChoice::Relay),
         }
     };
+    eprintln!("rc-bridge route={}", if first_route == crate::TransportChoice::Relay { "relay" } else { "p2p" });
     let label = if first_route == crate::TransportChoice::Relay { "中继" } else { "打洞" };
-    let first_frames = run_over(first, label, &grant)?;
+    let first_frames = run_over(first, None, label, &grant)?;
     if first_frames > 0 || stopped() {
         return Ok(());
     }
@@ -507,7 +536,7 @@ pub fn run_signaling_client(
         .request_relay(&options.target, Duration::from_secs(15))
         .map_err(|e| format!("中继重试时请求连接失败：{e}"))?;
     let transport = relay_of(&retry, "打洞无媒体，改走中继")?;
-    let frames = run_over(transport, "中继重试", &retry)?;
+    let frames = run_over(transport, None, "中继重试", &retry)?;
     if frames == 0 && !stopped() {
         return Err("打洞与中继都没有交付任何编码帧".into());
     }

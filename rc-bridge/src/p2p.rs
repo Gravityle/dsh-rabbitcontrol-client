@@ -21,6 +21,10 @@ pub fn filter_candidates(mut candidates: P2pCandidates, self_public: Option<&str
     candidates.peer_lan_addrs = rc_client_core::p2p::filter_cross_site_lan_addrs(
         &candidates.peer_lan_addrs, &local, &peer,
     );
+    eprintln!("rc-bridge P2P candidates: session={} local={:?} public={:?}/{:?} lan={:?} nat={:?}/{:?} start={:?} hmac={}",
+        candidates.session_id, candidates.local_udp_port, candidates.peer_public_addr,
+        candidates.peer_public_addrs, candidates.peer_lan_addrs, candidates.self_nat_type,
+        candidates.peer_nat_type, candidates.start_after_ms, candidates.punch_secret.is_some());
     candidates
 }
 
@@ -72,6 +76,7 @@ pub fn punch_client(
 ) -> Result<Box<dyn Transport>, String> {
     let config = mtls.to_quic_mtls_config()?;
     let cancel = AtomicBool::new(false);
+    let port_hold = rc_client_core::signal_client::acquire_local_udp_port_for_p2p(candidates.local_udp_port);
     let connection = attempt_p2p_quic_client_mtls(
         candidates,
         budget.punch,
@@ -85,7 +90,7 @@ pub fn punch_client(
         connection.rtt_us,
         if connection.peer_mtls_identity().is_some() { "已验证" } else { "缺失" }
     );
-    Ok(Box::new(connection))
+    Ok(Box::new(rc_client_core::signal_client::P2pHeldTransport::new(connection, port_hold)))
 }
 
 /// 被控端打洞。
@@ -100,6 +105,7 @@ pub fn punch_host(
 ) -> Result<Box<dyn Transport>, String> {
     let config = mtls.to_quic_mtls_config()?;
     let cancel = AtomicBool::new(false);
+    let port_hold = rc_client_core::signal_client::acquire_local_udp_port_for_p2p(candidates.local_udp_port);
     let connection = attempt_p2p_quic_host_mtls(
         candidates,
         budget.punch,
@@ -113,5 +119,5 @@ pub fn punch_host(
         connection.rtt_us,
         if connection.peer_mtls_identity().is_some() { "已验证" } else { "缺失" }
     );
-    Ok(Box::new(connection))
+    Ok(Box::new(rc_client_core::signal_client::P2pHeldTransport::new(connection, port_hold)))
 }
