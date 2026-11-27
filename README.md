@@ -7,7 +7,7 @@
 在 DeepSeek Harness 中把下面这句话发给助手，即可安装固定版本：
 
 ```text
-请用 plugin_manager 的 install_bundle 安装 https://github.com/Gravityle/dsh-rabbitcontrol-client/releases/download/v0.11.1/dsh-rabbitcontrol-client-0.11.1.tgz
+请用 plugin_manager 的 install_bundle 安装 https://github.com/Gravityle/dsh-rabbitcontrol-client/releases/download/v0.11.2/dsh-rabbitcontrol-client-0.11.2.tgz
 ```
 
 安装后打开左侧「远程桌面」，填写自己的 rc-server 地址并登录。包内附带 Apple Silicon Mac 和 Windows x64 边车，这两种平台可将 `bridgePath` 留空。
@@ -54,7 +54,7 @@
 
 ## 两个行为细节
 
-- **重连会自己恢复**：被控端（如 `rc-cli host`）的设计是「accept 一条连接、服务完就退出」，所以断开后立刻重连可能正好落在它重启的空档里——表现为连上但一帧不出、或连接被拒。边车遇到这两种情况会自动**间隔 2 秒重试同一地址一次**，仍失败才交给面板做"换地址 → 中继"的降级。
+- **断开后可以立即重连。** 两台设备均更新到 v0.11.2 后，控制端会先结束旧会话，被控端会继续等待下一次连接。「作为被控端」可以保持开启。对于每次只服务一个会话的直连程序（如 `rc-cli host`），连接失败或零帧时会在 2 秒后重试同一地址一次。
 - **设备显示名自动上报**：被控端上报的 `hostname` 取**宿主机名**（macOS 用「电脑名称」，例如 `mac-mini`），不需要手工设别名；面板优先显示 `alias`，没有就显示 `hostname`。同一台机器跑多个被控端时，可以用角色的后缀区分（例如 `mac-mini · 真桌面`）。
 
 ## 前提与限制

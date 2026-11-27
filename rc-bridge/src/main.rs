@@ -269,7 +269,7 @@ fn run_replay(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-fn run_session_once(args: &Args, connect: SocketAddr) -> Result<u64, String> {
+fn run_session_once(args: &Args, connect: SocketAddr, input: Option<&input::IpcCapture>) -> Result<u64, String> {
     let resolution = parse_resolution(&args.resolution)?;
     let duration = parse_duration(&args.duration)?;
 
@@ -308,11 +308,7 @@ fn run_session_once(args: &Args, connect: SocketAddr) -> Result<u64, String> {
         pipeline: pipeline.clone(),
         connect_timeout: Duration::from_secs(10),
         handshake_timeout: Duration::from_secs(10),
-        capture: if args.input == "none" {
-            Box::new(IdleCapture) as Box<dyn rc_input::InputCapture>
-        } else {
-            Box::new(input::IpcCapture::spawn()) as Box<dyn rc_input::InputCapture>
-        },
+        capture: input::session_capture(input),
         input_window: rc_input::DEFAULT_WINDOW,
         auth: ClientAuthConfig::default(),
     };
@@ -360,7 +356,7 @@ fn run_session_once(args: &Args, connect: SocketAddr) -> Result<u64, String> {
     let mut last_status = Instant::now();
     let mut datagrams = 0u64;
 
-    while client.state() != SessionState::Closed && t0.elapsed() < duration {
+    while client.state() != SessionState::Closed && t0.elapsed() < duration && !input.is_some_and(input::IpcCapture::stopped) {
         match client.state() {
             SessionState::Streaming => {
                 let now_us = u64::from(clock_reader());
@@ -414,22 +410,21 @@ fn run_session_once(args: &Args, connect: SocketAddr) -> Result<u64, String> {
 /// 重试仍失败就交回上层：面板还有"换下一个地址 → 改走中继"的降级。
 fn run_session(args: &Args, connect: SocketAddr) -> Result<(), String> {
     let delay = Duration::from_secs(2);
-    let attempt = run_session_once(args, connect);
-    let frames = match attempt {
+    let input = (args.input != "none").then(input::IpcCapture::spawn);
+    let stopped = || input.as_ref().is_some_and(input::IpcCapture::stopped);
+    match run_session_once(args, connect, input.as_ref()) {
+        _ if stopped() => return Ok(()),
         Ok(frames) if frames > 0 => return Ok(()),
-        Ok(_) => {
-            eprintln!("rc-bridge：本次会话 0 帧（被控端可能刚重启），{}s 后重试同一地址…", delay.as_secs());
-            0
-        }
-        Err(error) => {
-            eprintln!("rc-bridge：{error}；{}s 后重试同一地址…", delay.as_secs());
-            0
-        }
-    };
-    let _ = frames;
-    std::thread::sleep(delay);
-    let again = run_session_once(args, connect)?;
-    if again == 0 {
+        Ok(_) => eprintln!("rc-bridge：本次会话 0 帧，稍后重试"),
+        Err(error) => eprintln!("rc-bridge：{error}；稍后重试"),
+    }
+    let retry_at = Instant::now() + delay;
+    while Instant::now() < retry_at {
+        if stopped() { return Ok(()); }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let again = run_session_once(args, connect, input.as_ref())?;
+    if again == 0 && !stopped() {
         return Err("两次会话都没有交付任何编码帧".into());
     }
     Ok(())

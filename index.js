@@ -62,6 +62,7 @@ const REPORT_FILE = join(TMP, 'dsh-rabbitcontrol-client.log')
 const INPUT_PATH = '/rabbitcontrol-client/input'
 /** 宿主 → 边车的输入消息类型号，与 rc-bridge/src/input.rs 的 `INPUT_KIND` 一致。 */
 const INPUT_KIND = 10
+const CLOSE_SESSION_FRAME = Buffer.from([3, 0, 0, 0, 0])
 /** 输入请求体上限。 */
 const MAX_INPUT_BODY = 64 * 1024
 const BUNDLE_DIR = dirname(fileURLToPath(import.meta.url))
@@ -313,11 +314,20 @@ async function routeHandler(ctx, req, res) {
     return
   }
 
+  // 设备身份固定，旧信令连接退场以后才能用同一身份注册下一次会话。
+  while (active !== null) {
+    const previous = active
+    previous.stop()
+    await previous.closed
+    if (res.destroyed) return
+  }
   const child = spawn(settings.bridge, plan.args, {
     stdio: ['pipe', 'pipe', 'pipe'],
     ...(plan.env === undefined ? {} : { env: plan.env }),
   })
-  let finished = false
+  let stopping = false
+  let killTimer
+  let killDeadline
   // 首包到达前不写状态行：这样「边车起不来 / 对端没监听」能回一个可读的错误，
   // 而不是先给浏览器 200 再把真相丢进日志。
   let headersSent = false
@@ -327,23 +337,38 @@ async function routeHandler(ctx, req, res) {
     headersSent = true
     res.writeHead(status, headers)
   }
-  const finish = (reason) => {
-    if (finished) return
-    finished = true
-    console.log(`[rabbitcontrol-client] 流结束：${reason}`)
-    if (active !== null && active.child === child) active = null
-    if (!child.killed) child.kill('SIGTERM')
-    if (!headersSent) {
-      sendHead(502, { 'content-type': 'application/json; charset=utf-8' })
-      const detail = stderrTail.trim() === '' ? reason : stderrTail.slice(-600)
-      res.end(JSON.stringify({ error: 'bridge_failed', detail }))
-      return
+  // 继续消费 stdout，避免浏览器取消读取后，边车卡在输出而收不到结束指令。
+  const stop = () => {
+    if (stopping) return
+    stopping = true
+    child.stdout.resume()
+    if (!res.destroyed && !res.writableEnded) res.end()
+    if (plan.acceptsInput && child.stdin.writable) {
+      child.stdin.end(CLOSE_SESSION_FRAME)
+      killTimer = setTimeout(() => child.kill('SIGTERM'), 2500)
+    } else {
+      child.kill('SIGTERM')
     }
-    res.end()
+    killDeadline = setTimeout(() => child.kill('SIGKILL'), 4000)
   }
-
-  // 登记当前会话：输入路由要把事件写进它的 stdin。回放没有会话，输入无处可去。
-  active = { child, finish, acceptsInput: plan.acceptsInput === true }
+  // stdin 可能随边车提前退出而关闭。最终退出及诊断统一从 close 收取。
+  child.stdin.on('error', () => {})
+  child.once('error', error => { stderrTail = error.message })
+  const closed = new Promise(resolve => child.once('close', (code, signal) => {
+    clearTimeout(killTimer)
+    clearTimeout(killDeadline)
+    if (active?.child === child) active = null
+    const reason = `bridge exit code=${code} signal=${signal}`
+    console.log(`[rabbitcontrol-client] 流结束：${reason}`)
+    if (!res.destroyed && !res.writableEnded) {
+      if (!headersSent) {
+        sendHead(502, { 'content-type': 'application/json; charset=utf-8' })
+        res.end(JSON.stringify({ error: 'bridge_failed', detail: stderrTail.trim().slice(-600) || reason }))
+      } else res.end()
+    }
+    resolve()
+  }))
+  active = { child, stop, closed, acceptsInput: plan.acceptsInput === true }
 
   // 实际链路（direct / p2p / relay）用 kind=1 的 JSON 行回传，面板据此显示徽标。
   let routeSent = ''
@@ -357,9 +382,11 @@ async function routeHandler(ctx, req, res) {
     sendHead(200, { 'content-type': 'application/octet-stream', 'cache-control': 'no-store' })
     res.write(Buffer.concat([head, body]))
   }
-  if (plan.mode === 'connect') emitRoute('direct')
+  let pendingRoute = plan.mode === 'connect' ? 'direct' : ''
 
   child.stdout.on('data', (chunk) => {
+    if (stopping || res.destroyed) return
+    emitRoute(pendingRoute)
     sendHead(200, {
       'content-type': 'application/octet-stream',
       'cache-control': 'no-store',
@@ -371,18 +398,16 @@ async function routeHandler(ctx, req, res) {
       res.once('drain', () => { child.stdout.resume() })
     }
   })
-  child.stdout.on('error', () => { finish('stdout error') })
+  child.stdout.on('error', stop)
   child.stderr.on('data', (chunk) => {
     const text = String(chunk).trim()
     if (text === '') return
     stderrTail = `${stderrTail}${text}\n`.slice(-2000)
     console.log(`[rabbitcontrol-client] bridge: ${text}`)
-    if (/打洞成功/.test(text)) emitRoute('p2p')
-    else if (/打洞失败|→ 中继/.test(text)) emitRoute('relay')
+    if (/打洞成功/.test(text)) pendingRoute = 'p2p'
+    else if (/打洞失败|→ 中继/.test(text)) pendingRoute = 'relay'
   })
-  child.on('error', (error) => { finish(`spawn failed: ${error.message}`) })
-  child.on('exit', (code, signal) => { finish(`bridge exit code=${String(code)} signal=${String(signal)}`) })
-  res.once('close', () => { finish('client closed') })
+  res.once('close', () => { if (active?.child === child) stop() })
 }
 
 /**

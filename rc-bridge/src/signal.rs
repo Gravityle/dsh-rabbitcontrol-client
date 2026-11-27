@@ -307,6 +307,8 @@ pub fn run_signaling_client(
     use crate::relay;
     use crate::tee::TeeDecoder;
 
+    let input = accept_input.then(crate::input::IpcCapture::spawn);
+    let stopped = || input.as_ref().is_some_and(crate::input::IpcCapture::stopped);
     let cfg = server_config(&options.server_url, &options.device_key, options.ca_pem_path.as_deref(), options.signal_port)?;
     let camera_dir = cert_dir.to_path_buf();
     let manager = rc_client_core::cert_manager::CertManager::load_or_init(camera_dir.clone())?;
@@ -352,7 +354,7 @@ pub fn run_signaling_client(
     //
     // 为什么要能跑第二次：家里的网络可能经代理/NAT 出海，打洞会"握手成功但媒体不通"。
     // 那时只看打洞是否报错是不够的，必须看有没有真的收到帧，再决定是否改走中继。
-    let run_over = |transport: Box<dyn rc_net::Transport>, label: &str, with_input: bool, grant: &rc_client_core::signal_client::ConnectGrant| -> Result<u64, String> {
+    let run_over = |transport: Box<dyn rc_net::Transport>, label: &str, grant: &rc_client_core::signal_client::ConnectGrant| -> Result<u64, String> {
         let before = sink.lock().expect("帧出口锁").stats().0;
         let session_id = crate::derive_session_id();
         let session_cfg = ClientSessionConfig {
@@ -368,11 +370,7 @@ pub fn run_signaling_client(
             pipeline: pipeline.clone(),
             connect_timeout: Duration::from_secs(10),
             handshake_timeout: Duration::from_secs(15),
-            capture: if with_input {
-                Box::new(crate::input::IpcCapture::spawn()) as Box<dyn rc_input::InputCapture>
-            } else {
-                Box::new(crate::IdleCapture) as Box<dyn rc_input::InputCapture>
-            },
+            capture: crate::input::session_capture(input.as_ref()),
             input_window: rc_input::DEFAULT_WINDOW,
             auth: ClientAuthConfig {
                 owner_signer: if grant.is_owner_connection {
@@ -401,7 +399,7 @@ pub fn run_signaling_client(
         );
 
         let mut last_busy = true;
-        while client.state() != rc_session::SessionState::Closed && t0.elapsed() < duration {
+        while client.state() != rc_session::SessionState::Closed && t0.elapsed() < duration && !stopped() {
             match client.state() {
                 rc_session::SessionState::Streaming => {
                     let budget = if last_busy {
@@ -458,8 +456,8 @@ pub fn run_signaling_client(
         }
     };
     let label = if transport_choice == crate::TransportChoice::Relay { "中继" } else { "打洞" };
-    let first_frames = run_over(first, label, accept_input, &grant)?;
-    if first_frames > 0 {
+    let first_frames = run_over(first, label, &grant)?;
+    if first_frames > 0 || stopped() {
         return Ok(());
     }
     if transport_choice == crate::TransportChoice::P2p {
@@ -476,8 +474,8 @@ pub fn run_signaling_client(
         .request_connect(&options.target, Duration::from_secs(15))
         .map_err(|e| format!("中继重试时请求连接失败：{e}"))?;
     let transport = relay_of(&retry, "打洞无媒体，改走中继")?;
-    let frames = run_over(transport, "中继重试", accept_input, &retry)?;
-    if frames == 0 {
+    let frames = run_over(transport, "中继重试", &retry)?;
+    if frames == 0 && !stopped() {
         return Err("打洞与中继都没有交付任何编码帧".into());
     }
     Ok(())

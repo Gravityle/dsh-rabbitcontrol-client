@@ -5,7 +5,9 @@
 //! 编码器**把片段里的真 H.264 经同一条 QUIC 会话发出去，于是「设备列表 → 连接 → 真画面」
 //! 这条链路不需要任何系统权限就能完整验证。
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
+use rc_client_core::signal_client::RelayIncoming;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -303,8 +305,11 @@ pub fn run_signaling_host(options: &SignalHostOptions) -> Result<(), String> {
     };
     let deadline = Instant::now() + options.overall;
     let mut served = 0u32;
+    let mut pending = VecDeque::new();
+    let mut recent = VecDeque::new();
     while Instant::now() < deadline {
-        let Some(incoming) = handle.try_recv_incoming() else {
+        collect_requests(&mut pending, || handle.try_recv_incoming(), &recent);
+        let Some(incoming) = pending.pop_front() else {
             std::thread::sleep(Duration::from_millis(50));
             continue;
         };
@@ -312,10 +317,8 @@ pub fn run_signaling_host(options: &SignalHostOptions) -> Result<(), String> {
             "rc-bridge 信令被控端：收到来自 {} 的连接请求（session={}，中继 {}）",
             incoming.peer_id, incoming.session_id, incoming.relay_addr
         );
-        if !incoming.is_owner_connection {
-            eprintln!("rc-bridge：本机未开放跨账号协助");
-            continue;
-        }
+        if recent.len() == REQUEST_CAP { recent.pop_front(); }
+        recent.push_back((incoming.peer_id.clone(), incoming.session_id.clone()));
         let mtls = SessionMtlsBundle {
             ca_cert_pem: identity.ca_pem.clone(),
             cert_pem: identity.cert_pem.clone(),
@@ -331,7 +334,15 @@ pub fn run_signaling_host(options: &SignalHostOptions) -> Result<(), String> {
                 continue;
             }
         };
-        match serve_over(options, bytes.clone(), transport, auth.clone()) {
+        let mut poll_at = Instant::now();
+        let mut stop = || {
+            let now = Instant::now();
+            if now < poll_at { return false; }
+            poll_at = now + Duration::from_millis(25);
+            collect_requests(&mut pending, || handle.try_recv_incoming(), &recent);
+            pending.iter().any(|next| next.peer_id == incoming.peer_id)
+        };
+        match serve_over(options, bytes.clone(), transport, auth.clone(), &mut stop) {
             Ok(()) => {
                 served += 1;
                 eprintln!("rc-bridge 信令被控端：第 {served} 次会话结束，继续等下一个连接");
@@ -343,6 +354,29 @@ pub fn run_signaling_host(options: &SignalHostOptions) -> Result<(), String> {
         return Err("整个等待期内没有服务过任何会话".into());
     }
     Ok(())
+}
+
+// Match the upstream signaling queue bound. Each grant is usable once.
+const REQUEST_CAP: usize = 64;
+
+fn collect_requests(
+    pending: &mut VecDeque<RelayIncoming>,
+    mut receive: impl FnMut() -> Option<RelayIncoming>,
+    recent: &VecDeque<(String, String)>,
+) {
+    for _ in 0..REQUEST_CAP {
+        let Some(next) = receive() else { break };
+        if !next.is_owner_connection || recent.iter().any(|(peer, id)| {
+            *peer == next.peer_id && *id == next.session_id
+        }) { continue; }
+        // Keep only the newest grant per device, preserving other peers' place.
+        if let Some(slot) = pending.iter_mut().find(|old| old.peer_id == next.peer_id) {
+            *slot = next;
+        } else {
+            if pending.len() == REQUEST_CAP { pending.pop_front(); }
+            pending.push_back(next);
+        }
+    }
 }
 
 /// 按偏好选一条被控端传输：打洞优先，失败退回中继。
@@ -431,6 +465,7 @@ fn serve_over(
     bytes: Option<Arc<[u8]>>,
     transport: Box<dyn rc_net::Transport>,
     auth: HostAuthConfig,
+    stop: &mut dyn FnMut() -> bool,
 ) -> Result<(), String> {
     let resolution = match options.source {
         HostSource::Clip => clip_resolution(bytes.as_deref().ok_or("缺少片段数据")?, options.resolution)?,
@@ -510,19 +545,39 @@ fn serve_over(
         negotiated.width, negotiated.height, negotiated.fps
     );
     let connected = Instant::now();
-    let summary = host
-        .run(&mut || connected.elapsed() >= options.duration)
-        .map_err(|e| format!("会话运行失败：{e}"))?;
-    eprintln!(
-        "rc-bridge 信令被控端：会话结束，采集 {} / 编码 {} 帧 / 数据报 {}",
-        summary.captured, summary.frames_encoded, summary.datagrams_sent
-    );
+    // This transport was injected by signaling. Detached has no listening
+    // endpoint and can never resume here; the next grant creates a new host.
+    let mut budget = crate::RUN_POLL_BUDGET;
+    while host.state() == rc_session::SessionState::Streaming
+        && connected.elapsed() < options.duration && !stop()
+    {
+        let report = host.tick(budget).map_err(|e| format!("会话运行失败：{e}"))?;
+        if report.closed.is_some() { break; }
+        budget = if report.busy { crate::RUN_POLL_BUDGET } else { crate::RUN_IDLE_POLL_BUDGET };
+    }
+    let summary = host.close(rc_session::proto::ByeReason::Normal).map_err(|e| format!("会话收尾失败：{e}"))?;
+    eprintln!("rc-bridge 信令被控端：会话结束，采集 {} / 编码 {} 帧 / 数据报 {}",
+        summary.captured, summary.frames_encoded, summary.datagrams_sent);
     Ok(())
 }
 
 #[cfg(test)]
 mod resolution_tests {
     use super::*;
+
+    #[test]
+    fn coalesces_owner_requests_without_reusing_grants() {
+        let req = |peer: &str, id: &str, owner| RelayIncoming {
+            peer_id: peer.into(), session_id: id.into(), is_owner_connection: owner,
+            ..Default::default()
+        };
+        let mut stream = vec![req("a", "old", true), req("a", "fresh", true),
+            req("b", "other", true), req("a", "latest", true), req("c", "guest", false),
+            req("a", "old", true)].into_iter();
+        let mut pending = VecDeque::new();
+        collect_requests(&mut pending, || stream.next(), &VecDeque::from([("a".into(), "old".into())]));
+        assert_eq!(pending, [req("a", "latest", true), req("b", "other", true)]);
+    }
 
     #[test]
     fn auto_and_bounded_manual_requests() {

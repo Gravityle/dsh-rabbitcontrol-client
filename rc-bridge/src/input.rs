@@ -19,9 +19,10 @@
 //!   `mod` 是修饰键快照位（bit0 左 Ctrl、bit1 左 Shift、bit2 左 Alt、bit3 左 GUI，
 //!   高四位对应右侧）。
 
-use std::collections::VecDeque;
 use std::io::{BufReader, Read};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rc_input::{InputCapture, InputEvent, MouseButton};
@@ -33,65 +34,64 @@ pub const INPUT_KIND: u8 = 10;
 const MAX_INPUT_PAYLOAD: usize = 64 * 1024;
 
 /// 从 stdin 读输入事件的通道。
+#[derive(Clone)]
 pub struct IpcCapture {
-    rx: Receiver<InputEvent>,
-    queued: VecDeque<InputEvent>,
+    rx: Arc<Mutex<Receiver<InputEvent>>>,
+    stopped: Arc<AtomicBool>,
 }
 
 impl IpcCapture {
     /// 起一条读线程后构造。
     pub fn spawn() -> Self {
         let (tx, rx) = mpsc::channel();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let reader_stop = stopped.clone();
         std::thread::Builder::new()
             .name("rc-bridge-input".into())
-            .spawn(move || {
-                let stdin = std::io::stdin();
-                let mut reader = BufReader::new(stdin.lock());
-                let mut header = [0u8; 5];
-                loop {
-                    if reader.read_exact(&mut header).is_err() {
-                        break;
-                    }
-                    let kind = header[0];
-                    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-                    if len > MAX_INPUT_PAYLOAD {
-                        eprintln!("rc-bridge 输入通道：长度头 {len} 超限，停止读取");
-                        break;
-                    }
-                    let mut payload = vec![0u8; len];
-                    if reader.read_exact(&mut payload).is_err() {
-                        break;
-                    }
-                    if kind != INPUT_KIND {
-                        continue;
-                    }
-                    for event in parse_events(&payload) {
-                        if tx.send(event).is_err() {
-                            return;
-                        }
-                    }
-                }
-            })
+            .spawn(move || read_input(BufReader::new(std::io::stdin().lock()), tx, &reader_stop))
             .expect("输入读线程创建失败");
-        Self { rx, queued: VecDeque::new() }
+        Self { rx: Arc::new(Mutex::new(rx)), stopped }
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+}
+
+fn read_input(mut reader: impl Read, tx: Sender<InputEvent>, stopped: &AtomicBool) {
+    let mut header = [0; 5];
+    while reader.read_exact(&mut header).is_ok() {
+        let len = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+        if header[0] == 3 && len == 0 {
+            stopped.store(true, Ordering::Release);
+            break;
+        }
+        if len > MAX_INPUT_PAYLOAD {
+            eprintln!("rc-bridge 输入通道：长度头 {len} 超限，停止读取");
+            break;
+        }
+        let mut payload = vec![0; len];
+        if reader.read_exact(&mut payload).is_err() { break; }
+        if header[0] == INPUT_KIND {
+            for event in parse_events(&payload) {
+                if tx.send(event).is_err() { return; }
+            }
+        }
     }
 }
 
 impl InputCapture for IpcCapture {
     fn next_events(&mut self, timeout: Duration) -> Result<Vec<InputEvent>> {
-        if self.queued.is_empty() {
-            match self.rx.recv_timeout(timeout) {
-                Ok(event) => self.queued.push_back(event),
-                Err(_) => return Ok(Vec::new()),
-            }
-        }
-        loop {
-            match self.rx.try_recv() {
-                Ok(event) => self.queued.push_back(event),
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-            }
-        }
-        Ok(self.queued.drain(..).collect())
+        let rx = self.rx.lock().expect("input channel lock");
+        let Ok(first) = rx.recv_timeout(timeout) else { return Ok(Vec::new()) };
+        Ok(std::iter::once(first).chain(rx.try_iter()).collect())
+    }
+}
+
+pub fn session_capture(input: Option<&IpcCapture>) -> Box<dyn InputCapture> {
+    match input {
+        Some(input) => Box::new(input.clone()),
+        None => Box::new(crate::IdleCapture),
     }
 }
 
@@ -159,6 +159,16 @@ pub fn parse_events(payload: &[u8]) -> Vec<InputEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_requires_an_explicit_empty_kind_three_frame() {
+        for (bytes, expected) in [(&[][..], false), (&[3, 0, 0, 0, 1, 7], false),
+                                  (&[3, 0, 0], false), (&[3, 0, 0, 0, 0], true)] {
+            let stop = AtomicBool::new(false);
+            read_input(bytes, mpsc::channel().0, &stop);
+            assert_eq!(stop.load(Ordering::Acquire), expected);
+        }
+    }
 
     #[test]
     fn parses_all_event_kinds() {
