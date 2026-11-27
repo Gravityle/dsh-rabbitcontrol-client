@@ -270,6 +270,35 @@ async function prepareSignalSession(ctx, query, resolution) {
   }
 }
 
+// stdout pipe chunks can split a 5-byte header or an H.264 access unit at any byte.
+// Track only framing metadata, so a late stderr route announcement can be inserted
+// between records without buffering or delaying the first video frame.
+function frameBoundaries() {
+  const header = Buffer.alloc(5)
+  let headerBytes = 0
+  let payloadLeft = 0
+  return chunk => {
+    let offset = 0
+    let first = headerBytes === 0 && payloadLeft === 0 ? 0 : -1
+    while (offset < chunk.length) {
+      if (payloadLeft === 0) {
+        const bytes = Math.min(5 - headerBytes, chunk.length - offset)
+        chunk.copy(header, headerBytes, offset, offset + bytes)
+        offset += bytes
+        headerBytes += bytes
+        if (headerBytes < 5) break
+        payloadLeft = header.readUInt32BE(1)
+        headerBytes = 0
+      }
+      const bytes = Math.min(payloadLeft, chunk.length - offset)
+      payloadLeft -= bytes
+      offset += bytes
+      if (payloadLeft === 0 && first < 0) first = offset
+    }
+    return first
+  }
+}
+
 /**
  * 流式路由处理器：过框架围栏 → 校验参数 → 拉起边车 → 把 stdout 原样转发。
  * @param ctx - Host 上下文。
@@ -386,33 +415,44 @@ async function routeHandler(ctx, req, res) {
     const head = Buffer.alloc(5)
     head[0] = 1
     head.writeUInt32BE(body.length, 1)
-    sendHead(200, { 'content-type': 'application/octet-stream', 'cache-control': 'no-store' })
     res.write(Buffer.concat([head, body]))
   }
   let pendingRoute = plan.mode === 'connect' ? 'direct' : ''
+  const boundaryOf = parsed.signal ? frameBoundaries() : () => 0
 
   child.stdout.on('data', (chunk) => {
     if (stopping || res.destroyed) return
-    emitRoute(pendingRoute)
     sendHead(200, {
       'content-type': 'application/octet-stream',
       'cache-control': 'no-store',
       'x-accel-buffering': 'no',
     })
+    const boundary = boundaryOf(chunk)
+    if (boundary >= 0 && pendingRoute !== routeSent) {
+      if (boundary > 0) res.write(chunk.subarray(0, boundary))
+      emitRoute(pendingRoute)
+      if (boundary < chunk.length) res.write(chunk.subarray(boundary))
+    } else res.write(chunk)
     // 手动转发以便观察背压：写不动就暂停边车输出，drain 后继续。
-    if (res.write(chunk) === false && child.stdout.isPaused() === false) {
+    if (res.writableNeedDrain && child.stdout.isPaused() === false) {
       child.stdout.pause()
       res.once('drain', () => { child.stdout.resume() })
     }
   })
   child.stdout.on('error', stop)
-  child.stderr.on('data', (chunk) => {
-    const text = String(chunk).trim()
-    if (text === '') return
-    stderrTail = `${stderrTail}${text}\n`.slice(-2000)
-    console.log(`[rabbitcontrol-client] bridge: ${text}`)
-    if (/打洞成功/.test(text)) pendingRoute = 'p2p'
-    else if (/打洞失败|→ 中继/.test(text)) pendingRoute = 'relay'
+  child.stderr.setEncoding('utf8')
+  let partialLine = ''
+  child.stderr.on('data', text => {
+    stderrTail = (stderrTail + text).slice(-2000)
+    const lines = (partialLine + text).split('\n')
+    partialLine = lines.pop().slice(-2000)
+    for (const line of lines) {
+      if (!line.trim()) continue
+      console.log(`[rabbitcontrol-client] bridge: ${line.trim()}`)
+      if (!parsed.signal) continue
+      if (line.includes('打洞成功')) pendingRoute = 'p2p'
+      else if (line.includes('→ 中继')) pendingRoute = 'relay'
+    }
   })
   res.once('close', () => { if (active?.child === child) stop() })
 }

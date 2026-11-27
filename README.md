@@ -7,7 +7,7 @@
 在 DeepSeek Harness 中把下面这句话发给助手，即可安装固定版本：
 
 ```text
-请用 plugin_manager 的 install_bundle 安装 https://github.com/Gravityle/dsh-rabbitcontrol-client/releases/download/v0.12.0/dsh-rabbitcontrol-client-0.12.0.tgz
+请用 plugin_manager 的 install_bundle 安装 https://github.com/Gravityle/dsh-rabbitcontrol-client/releases/download/v0.12.1/dsh-rabbitcontrol-client-0.12.1.tgz
 ```
 
 安装后打开左侧「远程桌面」，填写自己的 rc-server 地址并登录。包内附带 Apple Silicon Mac 和 Windows x64 边车，这两种平台可将 `bridgePath` 留空。
@@ -28,7 +28,7 @@
 1. **第一次打开面板会看到「连接 rc-server」设置卡片**：填 rc-server 的 REST 地址（例如 `https://你的服务器:21118`）→ **保存地址** → 用 rc-server 账号**登录**。
    - 地址会写进插件配置（写不进时面板会说明），登录态存进凭据记录，**与「服务器状态」面板共用**；
    - 换服务器会自动清掉旧登录态，需要重新登录；账号首登被要求改密时，面板会提示先去改密。
-2. 登录后点「我的设备」中的在线设备。已公布直连地址的设备会依次尝试这些地址，随后尝试信令；无直连地址的设备直接使用信令。自动模式优先打洞，失败回退中继。
+2. 登录后点「我的设备」中的在线设备。插件按设备码发起信令连接，自动模式会尝试局域网或公网 P2P，打洞失败后回退到中继。使用独立监听的直连服务时，可在「高级与手动」中填写地址。
 3. 在线设备排在前面。对端关闭「允许远程控制」时，该行显示原因并禁用连接；旧服务端省略权限时沿用 Core 的平台默认值。
 4. 首次连接使用被控端可提供的最高分辨率。面板顶部显示实测 FPS，旁边的切换框显示当前解码宽高。选其他尺寸会短暂重连同一设备。点击画面右下角的全屏图标进入全屏，再点一次或按 Esc 退出。
 5. 需要开机时打开「显示离线设备」。对于同账号下已启用 Wake-on-LAN、且服务端报告支持唤醒的离线设备，可手动发送唤醒请求。设备所在局域网需要可用的在线代理。请求结果以服务端回执为准，设备重新显示在线后即可连接。
@@ -53,9 +53,10 @@
 - 随包的 Windows x64 边车用于控制其他设备。要让 Windows 共享真实屏幕，上游已有独立 GUI 的源码，使用 DXGI 和 Media Foundation；本插件的 Windows 边车没有集成该采集后端。Windows 上游主分支已实现 SendInput 键鼠注入和重连进度显示，目前通过源码构建使用。[Windows 上游源码](https://github.com/TokenBoom/rabbitcontrol-win/tree/02046f9a0)
 - 设备码与后端标签（如 `sck+videotoolbox`）会显示在开关下面；`hostDeviceKey` 与客户端的 `signalDeviceKey` 分开，避免互相顶掉。
 
-## 两个行为细节
+## 连接与播放细节
 
 - **断开后可以立即重连。** 两台设备均更新到 v0.11.2 后，控制端会先结束旧会话，被控端会继续等待下一次连接。「作为被控端」可以保持开启。对于每次只服务一个会话的直连程序（如 `rc-cli host`），连接失败或零帧时会在 2 秒后重试同一地址一次。
+- **解码恢复。** 浏览器遇到 H.264 解码错误时会释放失效的解码器，并从可用的关键帧重新开始显示。连接的实际帧率可在画面顶部查看。
 - **设备显示名自动上报**：被控端上报的 `hostname` 取**宿主机名**（macOS 用「电脑名称」，例如 `mac-mini`），不需要手工设别名；面板优先显示 `alias`，没有就显示 `hostname`。同一台机器跑多个被控端时，可以用角色的后缀区分（例如 `mac-mini · 真桌面`）。
 
 ## 前提与限制

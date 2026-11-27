@@ -34,8 +34,6 @@ window.__ModuleLoader__.load({
     const FENCE_401 = 'host-fence-401'
     /** 单帧字节上限（16 MiB）：超过就认为流错位。 */
     const MAX_FRAME_BYTES = 16 * 1024 * 1024
-    /** 拆帧缓冲上限（32 MiB）。 */
-    const MAX_BUFFER_BYTES = 32 * 1024 * 1024
 
     const ZH = {
       title: 'RabbitControl 远程桌面',
@@ -44,13 +42,11 @@ window.__ModuleLoader__.load({
       source: '来源',
       modeReplay: '回放测试片段',
       modeConnect: '连接被控端（直连地址）',
-      modeSignal: '经服务器（中继）',
+      modeSignal: '设备码连接',
       deviceId: '设备码',
       direct: '直连',
       relay: '中继',
-      relayHint: '跨网段用它：两端各自连中继，需要 rc-server 可达且已在「服务器状态」面板登录。',
-      retryAddress: '这个地址没通，自动换该设备的下一个地址重试…',
-      retryRelay: '直连地址都没通，自动改走中继重试…',
+      relayHint: '通过服务器按设备码协商 P2P 或中继链路，需要登录同一服务器。',
       address: '被控端地址',
       clip: '片段路径',
       fps: '帧率',
@@ -100,7 +96,7 @@ window.__ModuleLoader__.load({
       busy: '正在连接',
       manual: '手动地址（直连）',
       advanced: '高级与手动',
-      connectHint: '选择允许远控的在线设备：有地址会先直连，失败自动改走中继；没有地址直接走中继。',
+      connectHint: '选择允许远控的在线设备，即可通过设备码连接。',
       closeDrawer: '关闭',
       controlDisabled: '对端已关闭远程控制',
       thisMachine: '本机',
@@ -111,8 +107,7 @@ window.__ModuleLoader__.load({
       routeP2P: 'P2P 打洞',
       routeRelay: '中继',
       routeHint: '本次会话实际走的链路：直连（局域网/地址）、P2P 打洞（NAT 打洞成功）、中继（经服务器转发）',
-      routeDirectFirst: '直连优先',
-      routeRelayFirst: '经中继',
+      routeByCode: '设备码连接',
       showOffline: '显示离线设备',
       offlineHidden: '台离线设备已隐藏',
       hostEnable: '作为被控端（让别人看本机屏幕）',
@@ -153,13 +148,11 @@ window.__ModuleLoader__.load({
       source: 'Source',
       modeReplay: 'Replay test clip',
       modeConnect: 'Connect to device (direct address)',
-      modeSignal: 'Via server (relay)',
+      modeSignal: 'By device code',
       deviceId: 'Device code',
       direct: 'Direct',
       relay: 'Relay',
-      relayHint: 'For devices across networks: both ends connect to the relay; needs a reachable rc-server and a sign-in on the server-status panel.',
-      retryAddress: 'That address did not work; trying the next advertised address…',
-      retryRelay: 'No direct address worked; retrying through the relay…',
+      relayHint: 'Sign in to the same server to connect by device code over P2P or relay.',
       address: 'Device address',
       clip: 'Clip path',
       fps: 'Frame rate',
@@ -209,7 +202,7 @@ window.__ModuleLoader__.load({
       busy: 'connecting',
       manual: 'Manual address (direct)',
       advanced: 'Advanced and manual',
-      connectHint: 'Select an online device that allows remote control: it tries a direct address first and falls back to the relay; devices without an address go straight to the relay.',
+      connectHint: 'Select an online device that allows remote control to connect by device code.',
       closeDrawer: 'Close',
       controlDisabled: 'Remote control is disabled on this device',
       thisMachine: 'This machine',
@@ -220,8 +213,7 @@ window.__ModuleLoader__.load({
       routeP2P: 'P2P',
       routeRelay: 'relay',
       routeHint: 'The route this session actually uses: direct (LAN/address), P2P (NAT punch succeeded), or relay (through the server).',
-      routeDirectFirst: 'direct first',
-      routeRelayFirst: 'via relay',
+      routeByCode: 'by device code',
       showOffline: 'Show offline devices',
       offlineHidden: 'offline devices hidden',
       hostEnable: 'Act as a controlled device (let others view this screen)',
@@ -369,56 +361,12 @@ window.__ModuleLoader__.load({
     function deviceRowState(device, hostDeviceId, running) {
       const deviceId = String(device?.deviceId ?? '')
       const isSelf = hostDeviceId !== '' && deviceId === hostDeviceId
-      const connectable = device?.online === true && device.allowRemoteControl !== false && running !== true && !isSelf
+      const connectable = /^\d{9}$/.test(deviceId) && device?.online === true && device.allowRemoteControl !== false && running !== true && !isSelf
       return { isSelf, connectable }
     }
 
-    function deviceAddresses(device) {
-      if (!Array.isArray(device?.lanAddrs)) return []
-      return device.lanAddrs.filter(address => {
-        if (typeof address !== 'string' || address.length > 64) return false
-        const parts = /^(?:[A-Za-z0-9._-]+|\[([a-fA-F0-9:.]+)(?:%(\d{1,10}))?\]):(\d{1,5})$/.exec(address)
-        if (!parts || Number(parts[3]) < 1 || Number(parts[3]) > 65535 || Number(parts[2]) > 0xffffffff) return false
-        if (parts[1]) {
-          try { new URL(`http://[${parts[1]}]`) } catch { return false }
-        }
-        return true
-      })
-    }
-
-    /**
-     * 给一台设备挑「第一次尝试」：公布了地址就先直连，没有地址就直接走中继。
-     *
-     * 失败后的降级由 [`nextAttempt`] 负责（换地址 → 中继），所以用户只需点一下设备行。
-     * @param device - 设备列表里的一项。
-     * @returns 可直接交给 connect 的目标。
-     */
     function firstAttempt(device) {
-      const addresses = deviceAddresses(device)
-      const deviceId = String(device?.deviceId ?? '')
-      if (addresses.length > 0) return { address: addresses[0], addresses, deviceId }
-      return { signalDevice: deviceId }
-    }
-
-    /**
-     * 决定「这次没成」之后要不要自动再试一次。
-     *
-     * 顺序：先把该设备公布的**其它地址**都试一遍（例如 tailnet 地址不通时退到局域网地址），
-     * 都试完还有设备码，就降级到**中继**（信令）再试一次。
-     *
-     * @param current - `{ mode, address, deviceId, addresses, tried }`，`tried` 含刚用过的那个。
-     * @returns 下一次尝试（可直接交给 connect）或 `null`（放弃，交给调用方报错）。
-     */
-    function nextAttempt(current) {
-      const tried = Array.isArray(current.tried) ? current.tried : []
-      if (current.mode !== 'connect') return null
-      const candidates = Array.isArray(current.addresses) ? current.addresses : []
-      const next = candidates.find((item) => typeof item === 'string' && item !== '' && !tried.includes(item))
-      if (next !== undefined) return { address: next, viaRelay: false }
-      if (typeof current.deviceId === 'string' && current.deviceId !== '') {
-        return { signalDevice: current.deviceId, viaRelay: true }
-      }
-      return null
+      return { signalDevice: String(device.deviceId) }
     }
 
     /**
@@ -478,43 +426,35 @@ window.__ModuleLoader__.load({
       return undefined
     }
 
-    /**
-     * 一帧里有没有 IDR slice（NAL 5）。
-     * @param bytes - Annex-B 数据。
-     * @returns 是否关键帧。
-     */
-    function hasIdr(bytes) {
-      for (let i = 0; i + 3 < bytes.length; i += 1) {
-        if (bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 1 && (bytes[i + 3] & 0x1f) === 5) return true
-      }
-      return false
-    }
-
-    // Some H.264 encoders deliver parameter sets before the first IDR.
-    function startupFrame(bytes, sets) {
-      let start = -1
-      let type = 0
-      let hasSps = false
-      let hasPps = false
+    // Annex B places parameter sets ahead of the picture. Stop at the first slice
+    // so classifying a multi-megabyte IDR does not scan its compressed pixels.
+    function inspectPicture(bytes, sets) {
+      let parameter = ''
+      let start = 0
+      let sps = false
+      let pps = false
       function remember(end) {
-        if (start < 0 || end - start > 65536) return
-        if (type === 7) sets.sps = bytes.slice(start, end)
-        if (type === 8) sets.pps = bytes.slice(start, end)
+        if (parameter && end - start <= 65536) sets[parameter] = bytes.slice(start, end)
       }
       for (let i = 0; i + 3 < bytes.length; i++) {
         if (bytes[i] || bytes[i + 1] || bytes[i + 2] !== 1) continue
-        const prefix = i > 0 && bytes[i - 1] === 0 ? i - 1 : i
+        const prefix = i && !bytes[i - 1] ? i - 1 : i
         remember(prefix)
+        const type = bytes[i + 3] & 31
+        if (type >= 1 && type <= 5) return { key: type === 5, sps, pps }
+        parameter = type === 7 ? 'sps' : type === 8 ? 'pps' : ''
         start = prefix
-        type = bytes[i + 3] & 31
-        hasSps ||= type === 7
-        hasPps ||= type === 8
+        sps ||= type === 7
+        pps ||= type === 8
         i += 2
       }
       remember(bytes.length)
-      if (!hasIdr(bytes)) return null
-      if (hasSps && hasPps) return bytes
-      if (!sets.sps || !sets.pps) return null
+      return null
+    }
+
+    function startupFrame(bytes, sets, picture = inspectPicture(bytes, sets)) {
+      if (!picture?.key || !sets.sps || !sets.pps) return null
+      if (picture.sps && picture.pps) return bytes
       const length = sets.sps.length + sets.pps.length + bytes.length
       if (length > MAX_FRAME_BYTES) return null
       const frame = new Uint8Array(length)
@@ -522,6 +462,97 @@ window.__ModuleLoader__.load({
       frame.set(sets.pps, sets.sps.length)
       frame.set(bytes, sets.sps.length + sets.pps.length)
       return frame
+    }
+
+    function videoStream(signal, fps, replay, output, onCodec, onError, onDrop) {
+      const sets = {}
+      let decoder = null
+      let wake = null
+      let index = 0
+      let lastTimestamp = -1
+      const started = performance.now()
+      const close = () => {
+        const previous = decoder
+        decoder = null
+        if (previous && previous.state !== 'closed') previous.close()
+        wake?.()
+      }
+      signal.addEventListener('abort', close, { once: true })
+      const fail = (current, error) => {
+        if (signal.aborted || decoder !== current) return
+        close()
+        onError(error)
+      }
+      function send(current, data, key, timestamp) {
+        if (signal.aborted || current !== decoder || current.state !== 'configured') return
+        try {
+          current.decode(new window.EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp, data }))
+        } catch (error) { onDrop(); fail(current, error) }
+      }
+      // A dequeue notification is coalesced. Recheck the actual queue and wake
+      // on codec failure, disconnect or timeout as well as normal progress.
+      function waitFor(current, timeout, start) {
+        return new Promise(resolve => {
+          let done = false
+          const finish = () => {
+            if (done) return
+            done = true
+            clearTimeout(timer)
+            current.removeEventListener('dequeue', check)
+            wake = null
+            resolve()
+          }
+          const check = () => { if (!start && current.decodeQueueSize < 4) finish() }
+          const timer = setTimeout(() => {
+            fail(current, new Error('Decoder timed out'))
+            finish()
+          }, timeout)
+          wake = finish
+          if (start) start().then(finish, error => { fail(current, error); finish() })
+          else { current.addEventListener('dequeue', check); check() }
+        })
+      }
+      function feed(bytes) {
+        if (signal.aborted) return
+        const picture = inspectPicture(bytes, sets)
+        if (!picture) return
+        const timestamp = replay ? Math.round(index++ * 1e6 / Math.max(1, fps))
+          : Math.max(lastTimestamp + 1, Math.round((performance.now() - started) * 1000))
+        lastTimestamp = timestamp
+        if (decoder && decoder.state !== 'configured') fail(decoder, new Error('Decoder closed'))
+        let data = bytes
+        if (!decoder) {
+          data = startupFrame(bytes, sets, picture)
+          if (!data) { onDrop(); return }
+          const codec = codecFromAnnexB(sets.sps)
+          if (!codec) { onDrop(); return }
+          try {
+            const created = new window.VideoDecoder({
+              output(frame) {
+                try { if (!signal.aborted && decoder === created) output(frame) }
+                finally { frame.close() }
+              },
+              error(error) { fail(created, error) },
+            })
+            decoder = created
+            created.configure({ codec, optimizeForLatency: true })
+            onCodec(codec)
+          } catch (error) { onDrop(); fail(decoder, error); return }
+        }
+        const current = decoder
+        if (current.decodeQueueSize >= 4) {
+          return waitFor(current, replay ? 2000 : 300).then(() => {
+            if (signal.aborted) return
+            if (current === decoder) send(current, data, picture.key, timestamp)
+            else onDrop()
+          })
+        }
+        send(current, data, picture.key, timestamp)
+      }
+      return { feed, drain() {
+        const current = decoder
+        if (current?.state === 'configured') return waitFor(current, 2000, () => current.flush())
+      } }
     }
 
     /**
@@ -736,24 +767,30 @@ window.__ModuleLoader__.load({
       const modsRef = useRef(new Set())
       const inputSentRef = useRef(0)
       const canvasRef = useRef(null)
-      const decoderRef = useRef(null)
+      const video = useRef(null)
       const abortRef = useRef(null)
       const ownerRef = useRef(null)
       const mountedRef = useRef(true)
       const statsRef = useRef({ received: 0, decoded: 0, dropped: 0, errors: 0, size: '' })
-      const frameIndex = useRef(0)
-      /** 当前视频流的 H.264 参数集，断开时清空。 */
-      const parameterSets = useRef({})
-      const configuringRef = useRef(false)
       const supported = typeof window !== 'undefined' && typeof window.VideoDecoder === 'function'
 
       const publish = useCallback(() => {
         const now = performance.now()
         const decoded = statsRef.current.decoded
         const last = fpsSample.current
-        const fps = last && now > last.time && decoded > 0
-          ? Math.round((decoded - last.decoded) * 1000 / (now - last.time)) : null
-        fpsSample.current = { time: now, decoded }
+        let fps = null
+        if (last && now - last.time < 250) {
+          setMetrics({ ...statsRef.current, fps: last.fps })
+          return
+        }
+        const count = last ? decoded - last.decoded : 0
+        const elapsed = last ? now - last.time : 0
+        if (decoded && elapsed > 0) {
+          // Weight one previous active window lightly, but show a stall immediately.
+          const weight = count && last.count ? 0.25 : 0
+          fps = Math.round((count + weight * last.count) * 1000 / (elapsed + weight * last.elapsed))
+        }
+        fpsSample.current = { time: now, decoded, count, elapsed, fps }
         setMetrics({ ...statsRef.current, fps })
       }, [])
 
@@ -974,13 +1011,7 @@ window.__ModuleLoader__.load({
         const current = abortRef.current
         abortRef.current = null
         if (current !== null) current.abort()
-        parameterSets.current = {}
-        configuringRef.current = false
-        const decoder = decoderRef.current
-        decoderRef.current = null
-        if (decoder !== null) {
-          try { decoder.close() } catch { /* 已关闭 */ }
-        }
+        video.current = null
         if (frameRef.current && document.fullscreenElement === frameRef.current) {
           void document.exitFullscreen().catch(() => {})
         }
@@ -1014,41 +1045,6 @@ window.__ModuleLoader__.load({
         }
         const context = canvas.getContext('2d')
         if (context !== null) context.drawImage(frame, 0, 0)
-      }, [])
-
-      /** 把一帧交给已配置好的解码器。 */
-      const decodeChunk = useCallback((decoder, payload) => {
-        const key = hasIdr(payload)
-        try {
-          decoder.decode(new window.EncodedVideoChunk({
-            type: key ? 'key' : 'delta',
-            timestamp: Math.round((frameIndex.current * 1_000_000) / Math.max(1, state.fps)),
-            data: payload,
-          }))
-          frameIndex.current += 1
-        } catch (cause) {
-          statsRef.current.errors += 1
-          setError(`decode: ${cause instanceof Error ? cause.message : String(cause)}`)
-        }
-      }, [state.fps])
-
-      /**
-       * 挑一个浏览器确实支持的 codec 串：先试 SPS 里解析出来的，再退回常见取值。
-       * @param parsed - 从 SPS 拼出的 `avc1.PPCCLL`。
-       * @returns 可用的 codec 串。
-       */
-      const pickCodec = useCallback(async (parsed) => {
-        const candidates = [parsed, 'avc1.42E01E', 'avc1.4D401E', 'avc1.64001E']
-        if (typeof window.VideoDecoder.isConfigSupported !== 'function') return parsed
-        for (const codec of candidates) {
-          try {
-            const support = await window.VideoDecoder.isConfigSupported({ codec, avc: { format: 'annexb' } })
-            if (support?.supported === true) return codec
-          } catch {
-            // 试下一个候选
-          }
-        }
-        return parsed
       }, [])
 
       useEffect(() => { sendRef.current = sendInputEnabled }, [sendInputEnabled])
@@ -1192,111 +1188,66 @@ window.__ModuleLoader__.load({
         return () => { canvas.removeEventListener('wheel', handler) }
       }, [])
 
-      /** 处理一帧编码数据：首帧负责建解码器，其余按序送入。 */
       const feed = useCallback((payload) => {
         statsRef.current.received += 1
-        const decoder = decoderRef.current
-        if (decoder !== null) {
-          decodeChunk(decoder, payload)
-          return
-        }
-        const frame = startupFrame(payload, parameterSets.current)
-        if (frame === null) {
-          statsRef.current.dropped += 1
-          return
-        }
-        const codec = codecFromAnnexB(frame)
-        if (codec === undefined) {
-          statsRef.current.dropped += 1
-          return
-        }
-        if (configuringRef.current) return
-        configuringRef.current = true
-        const owner = ownerRef.current
-        void (async () => {
-          const chosen = await pickCodec(codec)
-          // await 期间会话可能已经断开或被替换：那时不能再建解码器。
-          if (ownerRef.current !== owner) return
-          let created = null
-          try {
-            created = new window.VideoDecoder({
-              output: (frame) => {
-                try {
-                  if (ownerRef.current !== owner) return
-                  draw(frame)
-                  if (!statsRef.current.decoded) setNotice('')
-                  statsRef.current.decoded += 1
-                } finally {
-                  frame.close()
-                }
-              },
-              error: (cause) => {
-                if (ownerRef.current !== owner) return
-                statsRef.current.errors += 1
-                setError(`${t('decodeFailed')}: ${cause?.message ?? String(cause)}`)
-              },
-            })
-            created.configure({ codec: chosen, avc: { format: 'annexb' }, optimizeForLatency: true })
-          } catch (cause) {
-            try { created?.close() } catch { /* 已关闭 */ }
-            // 下个关键帧可以重新尝试初始化。
-            configuringRef.current = false
-            statsRef.current.errors += 1
-            setError(`${t('decodeFailed')}: ${cause instanceof Error ? cause.message : String(cause)}`)
-            return
-          }
-          decoderRef.current = created
-          setDecoderLabel(chosen)
-          configuringRef.current = false
-          decodeChunk(created, frame)
-        })()
-      }, [decodeChunk, draw, pickCodec, t])
+        return video.current?.feed(payload)
+      }, [])
 
       /** 读流并按 `[kind u8][len u32 BE][payload]` 拆帧。 */
       const pump = useCallback(async (response, signal) => {
         const reader = response.body.getReader()
-        let buffer = new Uint8Array(0)
-        for (;;) {
-          if (signal.aborted) { await reader.cancel().catch(() => {}); return }
-          const { value, done } = await reader.read()
-          if (done || signal.aborted) return
-          if (value === undefined) continue
-          if (buffer.length + value.length > MAX_BUFFER_BYTES) {
-            statsRef.current.errors += 1
-            setError(`${t('streamError')}: buffer overflow`)
-            buffer = new Uint8Array(0)
-            continue
-          }
-          const merged = new Uint8Array(buffer.length + value.length)
-          merged.set(buffer, 0)
-          merged.set(value, buffer.length)
-          buffer = merged
-          for (;;) {
-            if (buffer.length < 5) break
-            const length = buffer[1] * 16777216 + (buffer[2] << 16) + (buffer[3] << 8) + buffer[4]
-            if (length > MAX_FRAME_BYTES) {
-              // 长度头不合理：流已经错位，丢弃并如实报错，别把内存吃光。
-              statsRef.current.errors += 1
-              setError(`${t('streamError')}: frame length ${String(length)} out of range`)
-              buffer = new Uint8Array(0)
-              break
+        const header = new Uint8Array(5)
+        const view = new DataView(header.buffer)
+        const text = new TextDecoder()
+        let headerBytes = 0
+        let payload = null
+        let written = 0
+        try {
+          while (!signal.aborted) {
+            const { value, done } = await reader.read()
+            if (signal.aborted) return
+            if (done) {
+              if (headerBytes) throw new Error(`${t('streamError')}: incomplete frame`)
+              return
             }
-            if (buffer.length < 5 + length) break
-            const kind = buffer[0]
-            const payload = buffer.slice(5, 5 + length)
-            buffer = buffer.slice(5 + length)
-            if (kind === 2) feed(payload)
-            else if (kind === 1) {
-              try {
-                const event = JSON.parse(new TextDecoder().decode(payload))
-                if (event?.event === 'route' && typeof event.route === 'string') setRoute(event.route)
-              } catch { /* 非 JSON 状态行忽略 */ }
+            let offset = 0
+            while (offset < value.length) {
+              if (headerBytes < header.length) {
+                const count = Math.min(header.length - headerBytes, value.length - offset)
+                header.set(value.subarray(offset, offset + count), headerBytes)
+                headerBytes += count
+                offset += count
+                if (headerBytes < header.length) continue
+                const length = view.getUint32(1)
+                if (length > MAX_FRAME_BYTES) throw new Error(`${t('streamError')}: frame length ${length} out of range`)
+                payload = new Uint8Array(length)
+                written = 0
+              }
+              const count = Math.min(payload.length - written, value.length - offset)
+              payload.set(value.subarray(offset, offset + count), written)
+              written += count
+              offset += count
+              if (written < payload.length) continue
+              if (header[0] === 2) {
+                const pending = feed(payload)
+                if (pending) await pending
+                if (signal.aborted) return
+              } else if (header[0] === 1) {
+                try {
+                  const event = JSON.parse(text.decode(payload))
+                  if (event?.event === 'route' && typeof event.route === 'string') setRoute(event.route)
+                } catch { /* 非 JSON 状态行忽略 */ }
+              }
+              headerBytes = 0
+              payload = null
             }
           }
+        } finally {
+          reader.releaseLock?.()
         }
       }, [feed])
 
-      const connect = useCallback(async (target = {}, requestedSize = resolution, message = '') => {
+      const connect = useCallback(async (target = {}, requestedSize = resolution, message = '', retryCodec = true) => {
         const mode = target.signalDevice ? 'signal' : target.address ? 'connect' : state.mode
         const address = (target.address ?? state.address).trim()
         const deviceId = mode === 'signal' ? (target.signalDevice ?? state.device).replace(/\s+/g, '') : target.deviceId
@@ -1304,14 +1255,12 @@ window.__ModuleLoader__.load({
         if (display.current.target !== displayTarget) display.current.nativeSize = ''
         display.current.target = displayTarget
         display.current.request = mode === 'replay' ? '' : requestedSize
-        const addresses = target.addresses ?? []
-        const tried = [...(target.tried ?? []), address]
         if (abortRef.current) teardown()
         const controller = new AbortController()
         abortRef.current = controller
         ownerRef.current = controller
         activeTarget.current = mode === 'signal' ? { signalDevice: deviceId } :
-          mode === 'connect' ? { address, deviceId, addresses, tried: target.tried } : null
+          mode === 'connect' ? { address, deviceId } : null
         sessionRef.current = mode !== 'replay'
         setState((current) => ({ ...current, mode, address, ...(mode === 'signal' ? { device: deviceId } : {}) }))
         setRunning(true)
@@ -1323,7 +1272,30 @@ window.__ModuleLoader__.load({
         setError('')
         setNotice(message)
         statsRef.current = { received: 0, decoded: 0, dropped: 0, errors: 0, size: '' }
-        frameIndex.current = 0
+        let firstOutput = true
+        let recoveryTimer = null
+        let codecError = ''
+        function clearRecovery() {
+          clearTimeout(recoveryTimer)
+          recoveryTimer = null
+        }
+        function recover() {
+          if (!controller.signal.aborted && retryCodec && mode !== 'replay') {
+            void connect(activeTarget.current, requestedSize, t('reconnecting'), false)
+          }
+        }
+        controller.signal.addEventListener('abort', clearRecovery, { once: true })
+        const stream = videoStream(controller.signal, state.fps, mode === 'replay', frame => {
+          draw(frame)
+          statsRef.current.decoded++
+          if (firstOutput) { firstOutput = false; clearRecovery(); codecError = ''; setNotice(''); setError('') }
+        }, codec => { firstOutput = true; setDecoderLabel(codec) }, cause => {
+          statsRef.current.errors++
+          codecError = `${t('decodeFailed')}: ${cause?.message ?? String(cause)}`
+          setError(codecError)
+          if (retryCodec && mode !== 'replay' && recoveryTimer === null) recoveryTimer = setTimeout(recover, 1500)
+        }, () => { statsRef.current.dropped++ })
+        video.current = stream
         fpsSample.current = null
         publish()
         const canvas = canvasRef.current
@@ -1351,25 +1323,23 @@ window.__ModuleLoader__.load({
           }
           await pump(response, controller.signal)
           if (controller.signal.aborted) return
+          await stream.drain()
+          if (controller.signal.aborted) return
+          if (codecError) { recover(); throw new Error(codecError) }
           if (!statsRef.current.decoded) throw new Error(t('streamError'))
           setNotice(t('sessionEnded'))
         } catch (cause) {
           if (controller.signal.aborted) return
           const reason = cause instanceof Error ? cause.message : String(cause)
-          const next = reason === FENCE_401 || reason.includes('device_disabled') ? null : nextAttempt({ mode, deviceId, addresses, tried })
-          if (next) {
-            void connect({ ...next, deviceId, addresses, tried }, requestedSize, t(next.viaRelay ? 'retryRelay' : 'retryAddress'))
-          } else {
-            setNotice('')
-            setError(reason === FENCE_401 ? t('fenceError') : reason)
-          }
+          setNotice('')
+          setError(reason === FENCE_401 ? t('fenceError') : reason)
         } finally {
           if (abortRef.current === controller) {
             teardown(controller)
             void loadDevices()
           }
         }
-      }, [loadDevices, publish, pump, resolution, state, t, teardown])
+      }, [draw, loadDevices, publish, pump, resolution, state, t, teardown])
 
       const currentSize = running ? metrics.size.replace('×', 'x') : ''
       const sizes = [...new Set([display.current.nativeSize, currentSize, ...RESOLUTIONS].filter(Boolean))]
@@ -1396,18 +1366,16 @@ window.__ModuleLoader__.load({
       const visibleDevices = showOffline ? devices : devices.filter((device) => device.online === true)
       const hiddenCount = devices.length - visibleDevices.length
       const deviceRows = visibleDevices.map((device) => {
-        const addresses = deviceAddresses(device)
         const deviceId = String(device.deviceId ?? '')
         const name = typeof device.alias === 'string' && device.alias !== '' ? device.alias : String(device.hostname ?? deviceId)
         const { isSelf, connectable } = deviceRowState(device, hostState.deviceId, running)
         const canWake = !isSelf && device.online === false && device.canWake === true
         const active = !isSelf && activeDevice === deviceId && deviceId !== ''
-        const route = addresses.length > 0 ? t('routeDirectFirst') : t('routeRelayFirst')
+        const route = t('routeByCode')
         const status = device.allowRemoteControl === false ? t('controlDisabled')
           : device.online !== true ? t('deviceOffline') : running ? t('busy') : route
-        const meta = [deviceId, device.os, addresses[0] ?? '', connectable ? status : '']
+        const meta = [deviceId, device.os, connectable ? status : '']
           .filter((part) => typeof part === 'string' && part !== '').join(' · ')
-        // 整行就是一个"连接"动作：有地址先直连、失败自动降级中继；没有地址直接走中继。
         const className = ['rcc-row', isSelf ? 'rcc-row-self' : '', active ? 'rcc-row-active' : '']
           .filter((part) => part !== '').join(' ')
         return h('li', {
@@ -1420,7 +1388,7 @@ window.__ModuleLoader__.load({
           'aria-label': isSelf ? `${t('thisMachine')} ${name}` : connectable ? `${t('connect')} ${name}` : `${name} · ${status}`,
           title: isSelf
             ? t('selfHint')
-            : !connectable ? status : (addresses.length > 0 ? addresses.join(' → ') : t('relayHint')),
+            : !connectable ? status : t('relayHint'),
           onClick: isSelf ? undefined : () => { if (connectable) void connect(firstAttempt(device)) },
           onKeyDown: isSelf
             ? undefined
@@ -1661,7 +1629,7 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'layout', 'locale', 'sidebarRight', 'sidebarRightTabs', 'shortcuts'],
       // 只给无头测试用：把纯映射函数暴露出来，好在没有浏览器时也能验证扫描码表。
-      __test: { startupFrame, normalizePoint, isReleaseShortcut, SCANCODES, modifierBits, MAX_FRAME_BYTES, MAX_BUFFER_BYTES, INPUT, nextAttempt, firstAttempt, deviceRowState, css: CSS },
+      __test: { videoStream, startupFrame, normalizePoint, isReleaseShortcut, SCANCODES, modifierBits, MAX_FRAME_BYTES, INPUT, firstAttempt, deviceRowState, css: CSS },
       apply(ctx) {
         guard('locale', () => {
           ctx.effect(() => ctx.locale.register(NS, { zh: ZH, en: EN }), 'rabbitcontrol-client: copy')
