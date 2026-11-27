@@ -20,7 +20,7 @@ window.__ModuleLoader__.load({
     let panelReady = false
     const ID = 'dsh-rabbitcontrol-client'
     const KIND = 'rabbitcontrol-client'
-    const RESOLUTIONS = ['auto', '3840x2160', '2560x1440', '1920x1080', '1600x900', '1280x720', '854x480']
+    const RESOLUTIONS = ['3840x2160', '2560x1440', '1920x1080', '1600x900', '1280x720', '854x480']
     const STREAM = '/rabbitcontrol-client/stream'
     const INPUT = '/rabbitcontrol-client/input'
     const DEVICES = '/rabbitcontrol-client/devices'
@@ -62,8 +62,7 @@ window.__ModuleLoader__.load({
       decoded: '已解码',
       dropped: '丢弃',
       decodeErrors: '解码错误',
-      resolution: '请求分辨率',
-      nativeResolution: '自动（被控端最高分辨率）',
+      resolution: '分辨率',
       decodedSize: '实际解码尺寸',
       reconnectHint: '更改后将重新连接当前设备。',
       reconnecting: '正在按新分辨率重连…',
@@ -93,7 +92,6 @@ window.__ModuleLoader__.load({
       selfHint: '这就是当前这台电脑：不需要连接它（别的电脑会在各自列表里连它）。',
       fullscreen: '全屏画面',
       exitFullscreen: '退出全屏',
-      fullscreenHint: '把画面铺满（隐藏列表与折叠区）；按 Esc 退出',
       routeDirect: '直连',
       routeP2P: 'P2P 打洞',
       routeRelay: '中继',
@@ -159,8 +157,7 @@ window.__ModuleLoader__.load({
       decoded: 'Decoded',
       dropped: 'Dropped',
       decodeErrors: 'Decode errors',
-      resolution: 'Requested resolution',
-      nativeResolution: 'Auto (device maximum)',
+      resolution: 'Resolution',
       decodedSize: 'Decoded size',
       reconnectHint: 'Changing resolution reconnects to this device.',
       reconnecting: 'Reconnecting at the new resolution…',
@@ -190,7 +187,6 @@ window.__ModuleLoader__.load({
       selfHint: 'This is the machine you are using: there is no need to connect to it (other machines connect to it from their own lists).',
       fullscreen: 'Full screen',
       exitFullscreen: 'Exit full screen',
-      fullscreenHint: 'Fill the panel with the picture (hides the list and advanced section); press Esc to exit',
       routeDirect: 'direct',
       routeP2P: 'P2P',
       routeRelay: 'relay',
@@ -298,6 +294,8 @@ window.__ModuleLoader__.load({
       '.rcc-canvas{display:block;width:100%;height:100%;object-fit:contain;outline:none}',
       '.rcc-canvas:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:-2px}',
       '.rcc-placeholder{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;padding:24px;text-align:center;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}',
+      '.rcc-fps{white-space:nowrap;font-variant-numeric:tabular-nums}',
+      '.rcc-frame .rcc-fullscreen{position:absolute;right:8px;bottom:8px;width:36px;height:36px;display:grid;place-items:center;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary)}',
       '.rcc-overlay{position:absolute;top:8px;right:8px;left:8px;display:flex;justify-content:flex-end;flex-wrap:wrap;gap:4px;pointer-events:none}',
       '.rcc-overlay .rcc-chip{white-space:normal;border-color:transparent;background:rgba(0,0,0,.55);color:#fff}',
       '.rcc-status{flex:none;display:flex;align-items:center;gap:8px;font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary)}',
@@ -634,6 +632,8 @@ window.__ModuleLoader__.load({
       const [state, setState] = useState({ mode: 'connect', address: '127.0.0.1:9901', device: '', fps: 30, clip: '' })
       const [resolution, setResolution] = useState('auto')
       const activeTarget = useRef(null)
+      const display = useRef({ target: '', nativeSize: '', request: 'auto' })
+      const fpsSample = useRef(null)
       const [running, setRunning] = useState(false)
       /** 当前连接目标（设备码），用于列表里高亮那一行。 */
       const [activeDevice, setActiveDevice] = useState('')
@@ -706,7 +706,13 @@ window.__ModuleLoader__.load({
       const supported = typeof window !== 'undefined' && typeof window.VideoDecoder === 'function'
 
       const publish = useCallback(() => {
-        setMetrics({ ...statsRef.current })
+        const now = performance.now()
+        const decoded = statsRef.current.decoded
+        const last = fpsSample.current
+        const fps = last && now > last.time && decoded > 0
+          ? Math.round((decoded - last.decoded) * 1000 / (now - last.time)) : null
+        fpsSample.current = { time: now, decoded }
+        setMetrics({ ...statsRef.current, fps })
       }, [])
 
       useEffect(() => {
@@ -916,7 +922,13 @@ window.__ModuleLoader__.load({
         if (decoder !== null) {
           try { decoder.close() } catch { /* 已关闭 */ }
         }
-        if (mountedRef.current) setRunning(false)
+        if (frameRef.current && document.fullscreenElement === frameRef.current) {
+          void document.exitFullscreen().catch(() => {})
+        }
+        if (mountedRef.current) {
+          setFill(false)
+          setRunning(false)
+        }
         // 依赖留空是有意的：teardown 只碰 refs 与 setState，而它调用的
         // flushInput/releaseModifiers 在本函数体内更晚才初始化——把它们的
         // 标识放进依赖数组会在渲染期触发 TDZ ReferenceError，面板直接崩。
@@ -934,6 +946,7 @@ window.__ModuleLoader__.load({
         const height = frame.displayHeight
         if (!(width > 0 && height > 0)) return
         statsRef.current.size = `${width}×${height}`
+        if (display.current.request === 'auto') display.current.nativeSize = `${width}x${height}`
         const canvas = canvasRef.current
         if (canvas === null) return
         if (canvas.width !== width || canvas.height !== height) {
@@ -1228,6 +1241,10 @@ window.__ModuleLoader__.load({
         const mode = target.signalDevice ? 'signal' : target.address ? 'connect' : state.mode
         const address = (target.address ?? state.address).trim()
         const deviceId = mode === 'signal' ? (target.signalDevice ?? state.device).replace(/\s+/g, '') : target.deviceId
+        const displayTarget = deviceId || address
+        if (display.current.target !== displayTarget) display.current.nativeSize = ''
+        display.current.target = displayTarget
+        display.current.request = mode === 'replay' ? '' : requestedSize
         const addresses = target.addresses ?? []
         const tried = [...(target.tried ?? []), address]
         if (abortRef.current) teardown()
@@ -1248,6 +1265,7 @@ window.__ModuleLoader__.load({
         setNotice(message)
         statsRef.current = { received: 0, decoded: 0, dropped: 0, errors: 0, size: '' }
         frameIndex.current = 0
+        fpsSample.current = null
         publish()
         const canvas = canvasRef.current
         if (canvas) canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height)
@@ -1294,9 +1312,11 @@ window.__ModuleLoader__.load({
         }
       }, [loadDevices, publish, pump, resolution, state, t, teardown])
 
+      const currentSize = running ? metrics.size.replace('×', 'x') : ''
+      const sizes = [...new Set([display.current.nativeSize, currentSize, ...RESOLUTIONS].filter(Boolean))]
       function changeResolution(event) {
         const value = event.target.value
-        if (!RESOLUTIONS.includes(value)) return
+        if (!sizes.includes(value)) return
         setResolution(value)
         if (activeTarget.current) void connect(activeTarget.current, value, t('reconnecting'))
       }
@@ -1375,11 +1395,12 @@ window.__ModuleLoader__.load({
                 route === '' ? '' : (route === 'direct' ? t('routeDirect') : (route === 'p2p' ? t('routeP2P') : t('routeRelay'))),
               ].filter((part) => part !== '').join(' · ')))),
         h('div', { className: 'rcc-head-actions' },
-          (session.authorized || running) && state.mode !== 'replay' ? h('label', { className: 'rcc-resolution', title: t('reconnectHint') },
-            h('span', null, t('resolution')),
-            h('select', { className: 'rcc-select', value: resolution, onChange: changeResolution, 'aria-description': t('reconnectHint') },
-              RESOLUTIONS.map((size) => h('option', { key: size, value: size }, size === 'auto' ? t('nativeResolution') : size.replace('x', ' × '))))) : null,
-          running && metrics.size ? h('span', { className: 'rcc-chip', key: 'live' }, `${t('decodedSize')} ${metrics.size}`) : null,
+          (session.authorized || running) && state.mode !== 'replay' ? h('div', { className: 'rcc-resolution' },
+            h('span', { className: 'rcc-fps' }, `${running ? (metrics.fps ?? '—') : '—'} FPS`),
+            h('select', { className: 'rcc-select', value: currentSize, onChange: changeResolution, 'aria-label': t('resolution'), title: t('reconnectHint') },
+              !currentSize ? h('option', { value: '', disabled: true, hidden: true }, '—') : null,
+              sizes.map(size => h('option', { key: size, value: size }, size.replace('x', ' × ')))))
+            : running && metrics.size ? h('span', { className: 'rcc-chip' }, `${metrics.fps ?? '—'} FPS · ${metrics.size}`) : null,
           h('button', {
             className: 'rcc-icon-btn', type: 'button', title: t('refresh'), 'aria-label': t('refresh'),
             onClick: () => { void loadDevices() },
@@ -1390,11 +1411,6 @@ window.__ModuleLoader__.load({
             title: t('advanced'),
             onClick: () => { openDrawer() },
           }, '⚙'),
-          h('button', {
-            className: 'rcc-btn', type: 'button', disabled: !running,
-            title: t('fullscreenHint'),
-            onClick: () => { void toggleFill() },
-          }, fill ? t('exitFullscreen') : t('fullscreen')),
           h('button', {
             className: 'rcc-btn', type: 'button', disabled: !running,
             onClick: () => { teardown(); setActiveDevice('') },
@@ -1475,6 +1491,12 @@ window.__ModuleLoader__.load({
                 onKeyUp: (event) => { onKey(event, false) },
                 onBlur: () => { releaseModifiers() },
               }),
+              running ? h('button', {
+                className: 'rcc-icon-btn rcc-fullscreen', type: 'button',
+                title: t(fill ? 'exitFullscreen' : 'fullscreen'), 'aria-label': t(fill ? 'exitFullscreen' : 'fullscreen'),
+                onClick: () => { void toggleFill() },
+              }, h('svg', { viewBox: '0 0 24 24', width: 20, height: 20, fill: 'none', stroke: 'currentColor', strokeWidth: 2, 'aria-hidden': true },
+                h('path', { d: fill ? 'M3 9h6V3m6 0v6h6M3 15h6v6m6 0v-6h6' : 'M9 3H3v6m12-6h6v6M3 15v6h6m6 0h6v-6' }))) : null,
               running
                 ? h('div', { className: 'rcc-overlay' }, h('span', { className: 'rcc-chip', key: 'state' }, stageText),
                     sendInputEnabled ? h('span', { className: 'rcc-chip' }, t('focusHint')) : null)

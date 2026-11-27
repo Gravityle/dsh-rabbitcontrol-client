@@ -7,7 +7,7 @@
 在 DeepSeek Harness 中把下面这句话发给助手，即可安装固定版本：
 
 ```text
-请用 plugin_manager 的 install_bundle 安装 https://github.com/Gravityle/dsh-rabbitcontrol-client/releases/download/v0.11.0/dsh-rabbitcontrol-client-0.11.0.tgz
+请用 plugin_manager 的 install_bundle 安装 https://github.com/Gravityle/dsh-rabbitcontrol-client/releases/download/v0.11.1/dsh-rabbitcontrol-client-0.11.1.tgz
 ```
 
 安装后打开左侧「远程桌面」，填写自己的 rc-server 地址并登录。包内附带 Apple Silicon Mac 和 Windows x64 边车，这两种平台可将 `bridgePath` 留空。
@@ -30,7 +30,7 @@
    - 换服务器会自动清掉旧登录态，需要重新登录；账号首登被要求改密时，面板会提示先去改密。
 2. 登录后点「我的设备」中的在线设备。已公布直连地址的设备会依次尝试这些地址，随后尝试信令；无直连地址的设备直接使用信令。自动模式优先打洞，失败回退中继。
 3. 在线设备排在前面。对端关闭「允许远程控制」时，该行显示原因并禁用连接；旧服务端省略权限时沿用 Core 的平台默认值。
-4. 「请求分辨率」默认选中「自动（被控端最高分辨率）」。也可选择 854×480 至 3840×2160 的六个档位。连接中切换会短暂重连同一设备。实际收到的宽高以解码画面为准。已有 H.264 片段按原始尺寸回放。
+4. 首次连接使用被控端可提供的最高分辨率。面板顶部显示实测 FPS，旁边的切换框显示当前解码宽高。选其他尺寸会短暂重连同一设备。点击画面右下角的全屏图标进入全屏，再点一次或按 Esc 退出。
 5. 点齿轮打开「高级与手动」抽屉，可查看帧率、设置手动地址和键鼠输入，或回放本地 H.264 片段。
 
 ## 配置
