@@ -43,17 +43,39 @@ fn parse_server_url(url: &str) -> Result<(String, u16, bool), String> {
         return Err(format!("服务端地址要以 http:// 或 https:// 开头：{url}"));
     };
     let rest = rest.split('/').next().unwrap_or(rest);
-    let (host, port) = match rest.rsplit_once(':') {
-        Some((host, port)) => {
-            let port = port.parse::<u16>().map_err(|_| format!("端口无效：{port}"))?;
-            (host.to_string(), port)
-        }
-        None => (rest.to_string(), if https { 443 } else { 80 }),
-    };
-    if host.is_empty() {
-        return Err(format!("服务端地址里没有主机名：{url}"));
-    }
+    let (host, port) = rc_client_core::server_config::parse_server_input(rest, if https { 443 } else { 80 })?;
     Ok((host, port, https))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_bracketed_ipv6_api_with_and_without_port() {
+        assert_eq!(parse_server_url("https://[::1]:21118/").unwrap(), ("::1".into(), 21118, true));
+        assert_eq!(parse_server_url("https://[::1]").unwrap(), ("::1".into(), 443, true));
+        assert!(parse_server_url("https://[::1").is_err());
+    }
+}
+
+/// 只请求服务端唤醒，成功仅表示收到相符的服务端 ACK。
+pub fn wake_target(options: &SignalOptions) -> Result<bool, String> {
+    let target = rc_client_core::server_config::parse_device_id_input(&options.target)
+        .ok_or("需要 9 位目标设备码")?;
+    if options.device_key.len() != 64 || !options.device_key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("唤醒登记需要独立的 64 位十六进制设备 key".into());
+    }
+    let cfg = server_config(&options.server_url, &options.device_key, options.ca_pem_path.as_deref(), options.signal_port)?;
+    if !cfg.use_https { return Err("唤醒请求需要 HTTPS 服务端".into()); }
+    let (handle, _) = register_and_wait(&cfg, &options.token, None, Vec::new(), options.wait, Registration::Wake)?;
+    let ack = handle.request_wol(&target, options.wait).map_err(|err| err.code)?;
+    if ack.target_device_id != target { return Err("唤醒响应的目标设备码不匹配".into()); }
+    println!("{}", serde_json::json!({
+        "event": "wol_ack", "ok": ack.ok, "targetId": target,
+        "method": ack.method, "code": ack.code.unwrap_or_default(),
+    }));
+    Ok(ack.ok)
 }
 
 /// 登记并请求连接目标设备，打印拿到的凭据。
@@ -221,6 +243,9 @@ pub fn server_config(
     })
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum Registration { Controller, Host, Wake }
+
 /// 起一个信令客户端并等它登记完成。
 ///
 /// @param cfg - 服务器配置。
@@ -235,16 +260,17 @@ pub fn register_and_wait(
     device_pubkey: Option<String>,
     lan_addrs: Vec<String>,
     wait: Duration,
-    allow_remote_control: bool,
+    role: Registration,
 ) -> Result<(SignalClientHandle, String), String> {
     let token = token.to_string();
     let handle = SignalClientHandle::spawn_with_options(
         cfg.clone(),
-        machine_name(),
+        if role == Registration::Wake { "rc-bridge-wake".into() } else { machine_name() },
         lan_addrs,
         SignalClientOptions {
             token_provider: Some(Arc::new(move || Ok(token.clone()))),
-            allow_remote_control: Some(allow_remote_control),
+            allow_remote_control: Some(role == Registration::Host),
+            dynamic_lan_discovery: role != Registration::Wake,
             device_pubkey,
             ..SignalClientOptions::default()
         },
@@ -313,12 +339,14 @@ pub fn run_signaling_client(
     let camera_dir = cert_dir.to_path_buf();
     let manager = rc_client_core::cert_manager::CertManager::load_or_init(camera_dir.clone())?;
     let pubkey = manager.device_pubkey_hex();
-    let (handle, device_id) = register_and_wait(&cfg, &options.token, Some(pubkey), Vec::new(), options.wait, false)?;
+    let (handle, device_id) = register_and_wait(&cfg, &options.token, Some(pubkey), Vec::new(), options.wait, Registration::Controller)?;
     let identity = identity::provision(&cfg, &options.token, &device_id, cert_dir)?;
 
-    let grant = handle
-        .request_connect(&options.target, Duration::from_secs(15))
-        .map_err(|e| format!("请求连接 {} 失败：{e}", options.target))?;
+    let grant = if transport_choice == crate::TransportChoice::Relay {
+        handle.request_relay(&options.target, Duration::from_secs(15))
+    } else {
+        handle.request_connect(&options.target, Duration::from_secs(15))
+    }.map_err(|e| format!("请求连接 {} 失败：{e}", options.target))?;
     eprintln!(
         "rc-bridge 信令：拿到凭据 relay={} peer_lan={:?} peer_public={:?}",
         grant.relay_addr, grant.peer_lan_addrs, grant.peer_public_addr
@@ -426,12 +454,17 @@ pub fn run_signaling_client(
         Ok(frames)
     };
 
-    let candidates = || P2pCandidates {
+    let candidates = || p2p::filter_candidates(P2pCandidates {
         session_id: grant.session_id.clone(),
         peer_public_addr: grant.peer_public_addr.clone(),
         peer_lan_addrs: grant.peer_lan_addrs.clone(),
         local_udp_port: grant.local_udp_port,
-    };
+        peer_public_addrs: grant.peer_public_addrs.clone(),
+        self_nat_type: grant.self_nat_type,
+        self_nat_port_delta: grant.self_nat_port_delta,
+        peer_nat_type: grant.peer_nat_type,
+        peer_nat_port_delta: grant.peer_nat_port_delta,
+    }, grant.self_public_addr.as_deref());
     let relay_of = |grant: &rc_client_core::signal_client::ConnectGrant, label: &str| -> Result<Box<dyn rc_net::Transport>, String> {
         eprintln!("rc-bridge 选路：{label} → 中继 {}", grant.relay_addr);
         relay::connect_relay(
@@ -444,18 +477,18 @@ pub fn run_signaling_client(
     };
 
     // 第一次尝试：按偏好打洞或直接中继。
-    let first: Box<dyn rc_net::Transport> = if transport_choice == crate::TransportChoice::Relay {
-        relay_of(&grant, "按要求只用中继")?
+    let (first, first_route) = if transport_choice == crate::TransportChoice::Relay {
+        (relay_of(&grant, "按要求只用中继")?, crate::TransportChoice::Relay)
     } else {
         match p2p::punch_client(&candidates(), &mtls_for(&grant), &p2p::PunchBudget::default()) {
-            Ok(transport) => transport,
+            Ok(transport) => (transport, crate::TransportChoice::P2p),
             Err(error) if transport_choice == crate::TransportChoice::P2p => {
                 return Err(format!("按要求只用打洞，但打洞失败：{error}"));
             }
-            Err(error) => relay_of(&grant, &format!("打洞失败（{error}）"))?,
+            Err(error) => (relay_of(&grant, &format!("打洞失败（{error}）"))?, crate::TransportChoice::Relay),
         }
     };
-    let label = if transport_choice == crate::TransportChoice::Relay { "中继" } else { "打洞" };
+    let label = if first_route == crate::TransportChoice::Relay { "中继" } else { "打洞" };
     let first_frames = run_over(first, label, &grant)?;
     if first_frames > 0 || stopped() {
         return Ok(());
@@ -463,7 +496,7 @@ pub fn run_signaling_client(
     if transport_choice == crate::TransportChoice::P2p {
         return Err("按要求只用打洞：会话没有交付任何编码帧".into());
     }
-    if transport_choice == crate::TransportChoice::Relay {
+    if first_route == crate::TransportChoice::Relay {
         return Err("中继会话没有交付任何编码帧".into());
     }
 
@@ -471,7 +504,7 @@ pub fn run_signaling_client(
     // 一次性令牌已被用掉，所以要重新 request_connect 拿新凭据，再走中继重试一次。
     eprintln!("rc-bridge 选路：打洞已连通但 0 帧（疑似代理/NAT 让媒体单向不通），重新取凭据改走中继");
     let retry = handle
-        .request_connect(&options.target, Duration::from_secs(15))
+        .request_relay(&options.target, Duration::from_secs(15))
         .map_err(|e| format!("中继重试时请求连接失败：{e}"))?;
     let transport = relay_of(&retry, "打洞无媒体，改走中继")?;
     let frames = run_over(transport, "中继重试", &retry)?;

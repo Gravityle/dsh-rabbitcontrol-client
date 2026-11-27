@@ -23,6 +23,7 @@ window.__ModuleLoader__.load({
     const RESOLUTIONS = ['3840x2160', '2560x1440', '1920x1080', '1600x900', '1280x720', '854x480']
     const STREAM = '/rabbitcontrol-client/stream'
     const INPUT = '/rabbitcontrol-client/input'
+    const WAKE = '/rabbitcontrol-client/wake'
     const DEVICES = '/rabbitcontrol-client/devices'
     const SESSION = '/rabbitcontrol-client/session'
     const SERVER = '/rabbitcontrol-client/server'
@@ -78,6 +79,20 @@ window.__ModuleLoader__.load({
       needHost: '需要先在别处把被控端跑起来（例如 rc-cli host --listen 127.0.0.1:9901 --backend real）。',
       myDevices: '我的设备',
       refresh: '刷新',
+      wake: '唤醒',
+      wakeSending: '正在发送…',
+      wakeSent: '已发送唤醒请求。稍后刷新设备列表查看是否上线。',
+      already_online: '设备已经在线，请刷新列表。',
+      wol_no_relay_peer: '未找到同网段的在线唤醒代理。',
+      rate_limited: '请求过于频繁，请稍后再试。',
+      wol_disabled: '设备未启用唤醒。',
+      forbidden: '请检查账号是否有权访问此设备。',
+      sign_in_required: '请重新登录后再试。',
+      bridge_failed: '边车唤醒失败。请确认所选 rc-bridge 支持 --signal-wake。',
+      wake_timeout: '唤醒请求超时。请刷新设备状态后再决定是否重试。',
+      wakeUnavailable: '此设备支持网络唤醒，需要 HTTPS 服务器和支持唤醒的边车。',
+      wakeFailed: '唤醒失败',
+      legacyDevices: '旧版服务端仅显示管理列表首页中归属于此账号的设备。',
       noDevices: 'rc-server 上还没有已注册设备。',
       needSignIn: '设备列表需要登录 rc-server：请先在「RabbitControl 服务器状态」面板登录。',
       deviceOffline: '离线',
@@ -105,7 +120,7 @@ window.__ModuleLoader__.load({
       hostStopped: '被控端未运行',
       hostDevice: '设备码',
       hostNeedLogin: '需要先登录 rc-server 才能作为被控端登记。',
-      windowsHostHint: 'Windows 随包边车可控制其他设备。要共享本机屏幕，请登录独立的 RabbitControl Windows GUI 并打开「本机被控」。该版本支持采集，键鼠注入尚未实现。',
+      windowsHostHint: 'Windows 随包边车可控制其他设备。要共享本机屏幕，请登录独立的 RabbitControl Windows GUI 并打开「本机被控」。新版 Windows GUI 支持屏幕采集和键鼠输入。',
       hostHint: '打开后本机会登记到 rc-server 并公示屏幕；真实屏幕采集需要所选边车支持。',
       hostInjectReal: '输入注入=真实（CGEvent）：对端可以操作本机的鼠标键盘。',
       hostInjectBlocked: '输入注入被系统拦下：对端只能看、不能操作。请到「系统设置 → 隐私与安全性 → 辅助功能」勾选 DeepSeek Harness，然后完全退出并重开 DSH。',
@@ -173,6 +188,20 @@ window.__ModuleLoader__.load({
       needHost: 'Start the controlled side first, e.g. rc-cli host --listen 127.0.0.1:9901 --backend real.',
       myDevices: 'My devices',
       refresh: 'Refresh',
+      wake: 'Wake',
+      wakeSending: 'Sending…',
+      wakeSent: 'Wake request sent. Refresh the device list shortly to check whether it is online.',
+      already_online: 'Already online. Refresh the device list.',
+      wol_no_relay_peer: 'No online wake relay on the target network.',
+      rate_limited: 'Too many requests. Try again later.',
+      wol_disabled: 'Wake is disabled on this device.',
+      forbidden: 'Check that this account has access to the device.',
+      sign_in_required: 'Sign in again and retry.',
+      bridge_failed: 'Bridge wake failed. Check that the selected rc-bridge supports --signal-wake.',
+      wake_timeout: 'Wake request timed out. Refresh the device status before retrying.',
+      wakeUnavailable: 'This device supports Wake-on-LAN. An HTTPS server and a wake-capable bridge are required.',
+      wakeFailed: 'Wake failed',
+      legacyDevices: 'Legacy server. Showing owned devices from the first page of the admin directory.',
       noDevices: 'No registered device on rc-server yet.',
       needSignIn: 'The device list needs an rc-server sign-in: use the “RabbitControl server status” panel first.',
       deviceOffline: 'offline',
@@ -200,7 +229,7 @@ window.__ModuleLoader__.load({
       hostStopped: 'Controlled side is stopped',
       hostDevice: 'Device',
       hostNeedLogin: 'Sign in to rc-server before this machine can register as a controlled device.',
-      windowsHostHint: 'The bundled Windows bridge controls other devices. To share this screen, sign in to the separate RabbitControl Windows GUI and turn on “本机被控”. Its current source supports capture; keyboard and mouse injection are pending.',
+      windowsHostHint: 'The bundled Windows bridge controls other devices. To share this screen, sign in to the separate RabbitControl Windows GUI and turn on “本机被控”. The current Windows GUI supports screen capture and keyboard and mouse input.',
       hostHint: 'When enabled this machine registers with rc-server and offers its screen. Sharing a real screen requires capture support in the selected bridge.',
       hostInjectReal: 'Input injection is live (CGEvent): the peer can drive this machine.',
       hostInjectBlocked: 'Input injection is blocked by macOS: the peer can watch but not control. Grant Accessibility to DeepSeek Harness in System Settings → Privacy & Security → Accessibility, then fully quit and reopen DSH.',
@@ -344,6 +373,19 @@ window.__ModuleLoader__.load({
       return { isSelf, connectable }
     }
 
+    function deviceAddresses(device) {
+      if (!Array.isArray(device?.lanAddrs)) return []
+      return device.lanAddrs.filter(address => {
+        if (typeof address !== 'string' || address.length > 64) return false
+        const parts = /^(?:[A-Za-z0-9._-]+|\[([a-fA-F0-9:.]+)(?:%(\d{1,10}))?\]):(\d{1,5})$/.exec(address)
+        if (!parts || Number(parts[3]) < 1 || Number(parts[3]) > 65535 || Number(parts[2]) > 0xffffffff) return false
+        if (parts[1]) {
+          try { new URL(`http://[${parts[1]}]`) } catch { return false }
+        }
+        return true
+      })
+    }
+
     /**
      * 给一台设备挑「第一次尝试」：公布了地址就先直连，没有地址就直接走中继。
      *
@@ -352,9 +394,7 @@ window.__ModuleLoader__.load({
      * @returns 可直接交给 connect 的目标。
      */
     function firstAttempt(device) {
-      const addresses = Array.isArray(device?.lanAddrs)
-        ? device.lanAddrs.filter((item) => typeof item === 'string' && item !== '')
-        : []
+      const addresses = deviceAddresses(device)
       const deviceId = String(device?.deviceId ?? '')
       if (addresses.length > 0) return { address: addresses[0], addresses, deviceId }
       return { signalDevice: deviceId }
@@ -643,6 +683,8 @@ window.__ModuleLoader__.load({
       const [metrics, setMetrics] = useState({ received: 0, decoded: 0, dropped: 0, errors: 0, size: '' })
 
       const [devices, setDevices] = useState([])
+      const wakePending = useRef(false)
+      const [wake, setWake] = useState({ pending: '', note: '' })
       const [devicesNote, setDevicesNote] = useState('')
       const [serverUrl, setServerUrl] = useState('')
       /** rc-server 会话：未配置地址或未登录时，主体显示设置卡片而不是设备列表。 */
@@ -740,12 +782,29 @@ window.__ModuleLoader__.load({
           setDevices([...list].sort((a, b) => Number(b.online === true) - Number(a.online === true)))
           if (payload.authorized !== true) setDevicesNote(t('needSignIn'))
           else if (typeof payload.error === 'string' && payload.error !== '') setDevicesNote(payload.error)
-          else setDevicesNote('')
+          else setDevicesNote(payload.legacy === true ? t('legacyDevices') : '')
         } catch (cause) {
           setDevicesNote(cause instanceof Error ? cause.message : String(cause))
         }
       }, [t])
 
+
+      async function wakeDevice(deviceId, name) {
+        if (wakePending.current) return
+        wakePending.current = true
+        setWake({ pending: deviceId, note: '' })
+        let note
+        try {
+          const res = await fetch(WAKE, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ deviceId }) })
+          const ack = await res.json().catch(() => ({}))
+          if (res.ok && ack.ok === true) note = t(ack.method === 'already_online' ? 'already_online' : 'wakeSent')
+          else if (Object.hasOwn(ZH, ack.code)) note = t(ack.code)
+          else if (res.status === 401 || res.status === 403) note = t('fenceError')
+          else note = `${t('wakeFailed')} (${ack.code || `HTTP ${res.status}`})`
+        } catch (error) { note = `${t('wakeFailed')} (${error.message})` }
+        finally { wakePending.current = false }
+        setWake({ pending: '', note: `${name} · ${note}` })
+      }
 
       /** 读一次会话状态（地址 + 是否已登录）。 */
       const refreshSession = useCallback(async () => {
@@ -1337,10 +1396,11 @@ window.__ModuleLoader__.load({
       const visibleDevices = showOffline ? devices : devices.filter((device) => device.online === true)
       const hiddenCount = devices.length - visibleDevices.length
       const deviceRows = visibleDevices.map((device) => {
-        const addresses = Array.isArray(device.lanAddrs) ? device.lanAddrs.filter((item) => typeof item === 'string' && item !== '') : []
+        const addresses = deviceAddresses(device)
         const deviceId = String(device.deviceId ?? '')
         const name = typeof device.alias === 'string' && device.alias !== '' ? device.alias : String(device.hostname ?? deviceId)
         const { isSelf, connectable } = deviceRowState(device, hostState.deviceId, running)
+        const canWake = !isSelf && device.online === false && device.canWake === true
         const active = !isSelf && activeDevice === deviceId && deviceId !== ''
         const route = addresses.length > 0 ? t('routeDirectFirst') : t('routeRelayFirst')
         const status = device.allowRemoteControl === false ? t('controlDisabled')
@@ -1354,9 +1414,9 @@ window.__ModuleLoader__.load({
           className,
           key: deviceId === '' ? name : deviceId,
           // 本机那条不是按钮：不可点、不可聚焦，读屏也不该把它念成"连接 X"。
-          role: isSelf ? 'listitem' : 'button',
+          role: connectable ? 'button' : 'listitem',
           tabIndex: connectable ? 0 : -1,
-          'aria-disabled': connectable ? undefined : 'true',
+          'aria-disabled': connectable || canWake ? undefined : 'true',
           'aria-label': isSelf ? `${t('thisMachine')} ${name}` : connectable ? `${t('connect')} ${name}` : `${name} · ${status}`,
           title: isSelf
             ? t('selfHint')
@@ -1378,7 +1438,11 @@ window.__ModuleLoader__.load({
             name,
             isSelf ? h('span', { className: 'rcc-self-chip', key: 'self' }, t('thisMachine')) : null),
           h('span', { className: 'rcc-row-meta', title: meta }, meta),
-          !isSelf && !connectable ? h('span', { className: 'rcc-hint' }, status) : null),
+          !isSelf && !connectable ? h('span', { className: 'rcc-hint' }, status) : null,
+          !isSelf && device.online === false && device.wolCapable && !canWake ? h('span', { className: 'rcc-hint' }, t('wakeUnavailable')) : null),
+        canWake ? h('button', { type: 'button', className: 'rcc-btn', 'aria-label': `${t('wake')} ${name}`, disabled: !!wake.pending,
+          onClick: () => { void wakeDevice(deviceId, name) },
+        }, t(wake.pending === deviceId ? 'wakeSending' : 'wake')) : null,
         h('span', { className: 'rcc-row-go' }, connectable ? '›' : ''))
       })
 
@@ -1461,10 +1525,11 @@ window.__ModuleLoader__.load({
             h('span', { className: 'rcc-count' }, String(visibleDevices.length)),
             h('span', { className: 'rcc-spacer' })),
           h('p', { className: 'rcc-hint rcc-pane-hint' }, t('connectHint')),
-          visibleDevices.length === 0
+          devices.length === 0
             ? h('p', { className: 'rcc-empty' }, devicesNote === '' ? t('noDevices') : devicesNote)
             : h('ul', { className: 'rcc-rows' }, deviceRows),
-          hiddenCount > 0 ? h('p', { className: 'rcc-empty' }, `${String(hiddenCount)} ${t('offlineHidden')}`) : null,
+          hiddenCount > 0 ? h('button', { type: 'button', className: 'rcc-btn', onClick: () => setShowOffline(true) }, `${t('showOffline')} (${hiddenCount})`) : null,
+          wake.note ? h('p', { className: 'rcc-empty', role: 'status' }, wake.note) : null,
           devices.length > 0 && devicesNote !== '' ? h('p', { className: 'rcc-empty' }, devicesNote) : null),
         h('section', { className: 'rcc-stage-pane' },
           h('div', { className: 'rcc-stage', key: 'stage' },

@@ -91,6 +91,9 @@ struct Args {
     /// 信令模式：拿到凭据后接着走中继跑控制端会话（把帧写到 --out）。
     #[arg(long, default_value_t = false)]
     signal_connect: bool,
+    /// 使用已登录账号向服务端请求一次 Wake-on-LAN 并等待确认。
+    #[arg(long, requires = "signal_target", conflicts_with_all = ["signal_connect", "serve", "connect", "replay"])]
+    signal_wake: bool,
     /// 信令被控端：上报给服务端的局域网候选地址。
     #[arg(long, default_value = "127.0.0.1:9901")]
     signal_lan: String,
@@ -511,6 +514,9 @@ fn run_signal_mode(args: &Args) -> Result<ExitCode, String> {
         wait: parse_duration(&args.signal_wait)?,
         signal_port: if args.signal_port == 0 { None } else { Some(args.signal_port) },
     };
+    if args.signal_wake {
+        return signal::wake_target(&options).map(|ok| if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+    }
     if args.signal_connect {
         signal::run_signaling_client(
             &options,

@@ -13,6 +13,36 @@ use rc_client_core::p2p::{attempt_p2p_quic_client_mtls, attempt_p2p_quic_host_mt
 use rc_client_core::relay_transport::SessionMtlsBundle;
 use rc_net::Transport;
 
+/// 采用 Core 与原生客户端相同的跨公网 LAN 候选过滤，再交由 Core 排序和打洞。
+pub fn filter_candidates(mut candidates: P2pCandidates, self_public: Option<&str>) -> P2pCandidates {
+    let local: Vec<_> = self_public.into_iter().collect();
+    let peer: Vec<_> = candidates.peer_public_addr.as_deref().into_iter()
+        .chain(candidates.peer_public_addrs.iter().map(String::as_str)).collect();
+    candidates.peer_lan_addrs = rc_client_core::p2p::filter_cross_site_lan_addrs(
+        &candidates.peer_lan_addrs, &local, &peer,
+    );
+    candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cross_site_filter_preserves_public_candidates_and_nat_hints() {
+        let mut candidates = P2pCandidates::default();
+        candidates.peer_public_addr = Some("203.0.113.9:5000".into());
+        candidates.peer_public_addrs = vec!["[2606:4700::1]:5001".into()];
+        candidates.peer_lan_addrs = vec!["192.168.1.1:5000".into()];
+        candidates.peer_nat_port_delta = Some(2);
+        candidates.self_nat_port_delta = Some(4);
+        let filtered = filter_candidates(candidates, Some("198.51.100.2:4000"));
+        assert!(filtered.peer_lan_addrs.is_empty());
+        assert_eq!(filtered.peer_public_addrs, ["[2606:4700::1]:5001"]);
+        assert_eq!((filtered.self_nat_port_delta, filtered.peer_nat_port_delta), (Some(4), Some(2)));
+    }
+}
+
 /// 一次打洞的时间预算。
 pub struct PunchBudget {
     /// 打洞（UDP 探测对齐）上限。
@@ -23,9 +53,10 @@ pub struct PunchBudget {
 
 impl Default for PunchBudget {
     fn default() -> Self {
-        // 打洞预算要**短**：没有 LAN 候选（例如插件自带的被控端）时打洞基本必失败，
-        // 而两端都要"打洞失败 → 转中继"，预算太长会让先转过去的那端在配对前就超时。
-        Self { punch: Duration::from_secs(2), quic: Duration::from_secs(3) }
+        Self {
+            punch: rc_client_core::p2p::DEFAULT_PUNCH_TIMEOUT,
+            quic: rc_client_core::p2p::DEFAULT_QUIC_HANDSHAKE_TIMEOUT,
+        }
     }
 }
 

@@ -9,10 +9,15 @@
  */
 import z from '@deepseek-ai/schemastery'
 import { appendFileSync, existsSync, writeFileSync } from 'node:fs'
+import { isIPv6 } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
+import { createHash, randomBytes } from 'node:crypto'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { promisify } from 'node:util'
+const runBridge = promisify(execFile)
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 
@@ -178,7 +183,9 @@ function normalizeAddress(value) {
   if (typeof value !== 'string') return undefined
   const trimmed = value.trim()
   if (trimmed.length === 0 || trimmed.length > MAX_ADDRESS_LEN) return undefined
-  if (!/^[A-Za-z0-9._-]+:\d{1,5}$/.test(trimmed)) return undefined
+  const parts = /^(?:[A-Za-z0-9._-]+|\[([a-fA-F0-9:.]+)(?:%(\d{1,10}))?\]):(\d{1,5})$/.exec(trimmed)
+  if (!parts || Number(parts[3]) < 1 || Number(parts[3]) > 65535) return undefined
+  if (parts[1] && (!isIPv6(parts[1]) || Number(parts[2]) > 0xffffffff)) return undefined
   return trimmed
 }
 
@@ -218,7 +225,7 @@ function bridgeArgs(query) {
     return { args: ['--replay', clip, '--fps', String(fps), '--out', '-'], acceptsInput: false, mode: 'replay' }
   }
   const connect = normalizeAddress(query.get('connect'))
-  if (connect === undefined) return { error: '被控端地址必须形如 host:port' }
+  if (connect === undefined) return { error: '被控端地址须为 host:port 或 [IPv6]:port，端口范围 1–65535' }
   const duration = query.get('duration') ?? '600s'
   if (!/^\d{1,5}(s|ms)?$/.test(duration)) return { error: '会话时长不合法' }
   return { args: ['--connect', connect, '--resolution', resolution, '--fps', String(fps), '--duration', duration, '--out', '-'], acceptsInput: true, mode: 'connect' }
@@ -424,7 +431,7 @@ function rcRequest(path, options = {}) {
   return new Promise((resolve) => {
     let url
     try {
-      url = new URL(path, `${settings.server}/`)
+      url = new URL(path, `${options.server ?? settings.server}/`)
     } catch {
       resolve({ status: 0, json: undefined, text: '', transportError: `rc-server 地址无效：${settings.server}` })
       return
@@ -440,7 +447,7 @@ function rcRequest(path, options = {}) {
     if (typeof token === 'string' && token !== '') headers.authorization = `Bearer ${token}`
     const req = transport({
       protocol: url.protocol,
-      hostname: url.hostname,
+      hostname: url.hostname.replace(/^\[|\]$/g, ''),
       port: url.port === '' ? undefined : url.port,
       path: `${url.pathname}${url.search}`,
       method,
@@ -859,7 +866,7 @@ function describeFailure(res) {
  * @param ctx - Host 上下文。
  * @returns token，或 undefined（未登录 / 已失效）。
  */
-async function accessToken(ctx) {
+async function accessToken(ctx, server = settings.server) {
   let credentials
   try { credentials = ctx.get('credentials') } catch { credentials = undefined }
   if (credentials === undefined) return undefined
@@ -870,7 +877,8 @@ async function accessToken(ctx) {
   const fresh = typeof session.expiresAt === 'number' && session.expiresAt - Date.now() > 30_000
   if (fresh) return session.accessToken
   if (typeof session.refreshToken !== 'string' || session.refreshToken === '') return undefined
-  const refreshed = await rcRequest('/api/v1/auth/refresh', { method: 'POST', body: { refresh_token: session.refreshToken } })
+  if (server !== settings.server) return undefined
+  const refreshed = await rcRequest('/api/v1/auth/refresh', { server, method: 'POST', body: { refresh_token: session.refreshToken } })
   if (refreshed.status !== 200 || typeof refreshed.json?.access_token !== 'string') return undefined
   const next = {
     accessToken: refreshed.json.access_token,
@@ -879,8 +887,27 @@ async function accessToken(ctx) {
     role: refreshed.json.user?.role ?? session.role,
     expiresAt: Date.now() + (typeof refreshed.json.expires_in_sec === 'number' ? refreshed.json.expires_in_sec : 900) * 1000,
   }
-  try { await credentials.modifyRecord(CREDENTIAL_KEY, async () => ({ kind: 'grant', payload: next })) } catch { /* 写不进就用这一次 */ }
+  try {
+    const record = await credentials.modifyRecord(CREDENTIAL_KEY, async current =>
+      server === settings.server && current?.payload?.refreshToken === session.refreshToken ? { kind: 'grant', payload: next } : undefined)
+    if (server !== settings.server || record?.payload?.accessToken !== next.accessToken) return undefined
+  } catch { if (server !== settings.server) return undefined }
   return next.accessToken
+}
+
+// Older servers can lack the account endpoint. Their global directory requires an
+// administrator, and rows without a verified owner must never reach this panel.
+async function accountDeviceList(options) {
+  const own = await rcRequest('/api/v1/me/devices', options)
+  if (own.status !== 404 && own.status !== 405) return own
+  const me = await rcRequest('/api/v1/me', options)
+  if (me.status !== 200) return me
+  if (me.json?.role !== 'admin' || me.json.must_change_password === true || typeof me.json.id !== 'string' || !me.json.id) {
+    return { status: 403, json: { message: '此服务器缺少同账号设备列表接口，请升级 rc-server。' } }
+  }
+  const legacy = await rcRequest(`/api/v1/devices?limit=${MAX_DEVICES}`, options)
+  if (legacy.status !== 200 || !Array.isArray(legacy.json?.devices)) return legacy
+  return { ...legacy, legacy: true, json: { devices: legacy.json.devices.filter(row => row?.owner_user_id === me.json.id) } }
 }
 
 /**
@@ -917,13 +944,14 @@ async function devicesHandler(ctx, req, res) {
     res.end(body)
   }
   try {
-    const token = await accessToken(ctx)
-    if (token === undefined) {
+    const server = settings.server
+    const token = await accessToken(ctx, server)
+    if (token === undefined || server !== settings.server) {
       reply({ authorized: false, server: settings.server, devices: [] })
       return
     }
-    const result = await rcRequest('/api/v1/devices', { token })
-    if (result.status === 401) {
+    const result = await accountDeviceList({ token, server })
+    if (result.status === 401 || server !== settings.server) {
       reply({ authorized: false, server: settings.server, devices: [] })
       return
     }
@@ -931,13 +959,18 @@ async function devicesHandler(ctx, req, res) {
       reply({ authorized: true, server: settings.server, devices: [], error: describeFailure(result) })
       return
     }
-    const rows = Array.isArray(result.json?.devices) ? result.json.devices : []
+    if (!Array.isArray(result.json?.devices)) {
+      reply({ authorized: true, server: settings.server, devices: [], error: '服务器返回了无法识别的设备列表。' })
+      return
+    }
+    const rows = result.json.devices
     // 被管理端禁用的设备不列出来：它们连不上，列着只会让人点空。
     const usable = rows.filter((row) => row && row.disabled !== true)
     usable.sort((a, b) => Number(b.online === true) - Number(a.online === true))
     reply({
       authorized: true,
       server: settings.server,
+      legacy: result.legacy === true,
       devices: usable.slice(0, MAX_DEVICES).map((row) => ({
         deviceId: row?.device_id,
         alias: row?.alias ?? '',
@@ -945,12 +978,85 @@ async function devicesHandler(ctx, req, res) {
         os: row?.os ?? '',
         online: row?.online === true,
         inSession: row?.in_session === true,
-        allowRemoteControl: row?.allow_remote_control ?? !/android|ios/i.test(row?.os ?? ''),
-        lanAddrs: Array.isArray(row?.lan_addrs) ? row.lan_addrs.filter((item) => typeof item === 'string') : [],
+        allowRemoteControl: row.allow_remote_control ?? !/android|ios/i.test(row.os ?? ''),
+        wolCapable: !result.legacy && row.wol_capable === true,
+        canWake: !result.legacy && row.wol_capable === true && row.online === false && row.in_session !== true
+          && Boolean(settings.bridge) && settings.server.startsWith('https://') && SIGNAL_DEVICE_ID.test(row.device_id),
+        lanAddrs: Array.isArray(row?.lan_addrs) ? row.lan_addrs.map(normalizeAddress).filter(Boolean) : [],
       })),
     })
   } catch (error) {
     reply({ authorized: false, server: settings.server, devices: [], error: error instanceof Error ? error.message : String(error) })
+  }
+}
+
+let wakeBusy = false
+
+async function wakeHandler(ctx, req, res) {
+  if (!fence(ctx, req, res)) return
+  if (req.method !== 'POST') {
+    res.writeHead(405, { allow: 'POST' }).end()
+    return
+  }
+  const reply = (status, code, method) => {
+    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+    res.end(JSON.stringify({ ok: status === 200, code, method }))
+  }
+  if (req.headers['content-type']?.split(';')[0] !== 'application/json') return reply(415, 'invalid_input')
+  let target
+  try { target = JSON.parse(await readBody(req, 1024)).deviceId } catch { return reply(400, 'invalid_input') }
+  if (typeof target !== 'string' || !SIGNAL_DEVICE_ID.test(target)) return reply(400, 'invalid_input')
+  if (wakeBusy) return reply(409, 'wake_busy')
+  const config = settings
+  const { server, bridge } = config
+  if (!server.startsWith('https://') || !bridge) return reply(409, 'bridge_unavailable')
+  wakeBusy = true
+  let directory
+  try {
+    const token = await accessToken(ctx)
+    if (!token || settings !== config) return reply(401, 'sign_in_required')
+    const options = { server, token }
+    const own = await rcRequest('/api/v1/me/devices', options)
+    if (own.status !== 200) return reply(own.status || 502, own.status === 401 ? 'sign_in_required' : own.status === 403 ? 'forbidden' : 'account_list_unavailable')
+    const device = own.json?.devices?.find(row => row?.device_id === target)
+    if (!device || device.disabled === true) return reply(403, 'forbidden')
+    if (device.online !== false || device.in_session === true) return reply(409, 'already_online')
+    if (device.wol_capable !== true || target === host.deviceId) return reply(409, 'wol_disabled')
+    const me = await rcRequest('/api/v1/me', options)
+    if (me.status !== 200 || typeof me.json?.id !== 'string' || !me.json.id) return reply(403, 'forbidden')
+    const scope = createHash('sha256').update(JSON.stringify([server, me.json.id])).digest('hex')
+    const identity = await ctx.get('credentials').modifyRecord(`dsh-rabbitcontrol/wake-${scope}`, async current =>
+      current?.kind === 'api-key' && /^[0-9a-f]{64}$/.test(current.key) ? undefined : { kind: 'api-key', key: randomBytes(32).toString('hex') })
+    if (!identity?.key) return reply(503, 'bridge_unavailable')
+    const ca = await rcRequest('/api/v1/pki/ca', { server })
+    if (ca.status !== 200 || typeof ca.json?.ca_cert_pem !== 'string' || !ca.json.ca_cert_pem) return reply(502, 'ca_unavailable')
+    directory = await mkdtemp(join(TMP, 'rc-wake-'))
+    const caPath = join(directory, 'ca.pem')
+    await writeFile(caPath, ca.json.ca_cert_pem, { mode: 0o600 })
+    if (settings !== config || (await readSession(ctx))?.accessToken !== token) return reply(409, 'session_changed')
+    const args = ['--signal-wake', '--signal-target', target, '--signal-server', server, '--signal-device-key', identity.key,
+      '--signal-ca', caPath, '--signal-wait', '8s']
+    let output
+    let failed = false
+    try {
+      output = await runBridge(bridge, args, { env: { ...process.env, RC_SIGNAL_TOKEN: token }, timeout: 20000, killSignal: 'SIGKILL', maxBuffer: 65536, windowsHide: true })
+    } catch (error) {
+      if (error.killed) return reply(504, 'wake_timeout')
+      if (error.code !== 1 || !error.stdout?.trim()) return reply(502, 'bridge_failed')
+      output = error
+      failed = true
+    }
+    let ack
+    try { ack = JSON.parse(output.stdout.trim()) } catch { return reply(502, 'invalid_ack') }
+    if (ack?.event !== 'wol_ack' || ack.targetId !== target || typeof ack.ok !== 'boolean' || ack.ok === failed) return reply(502, 'invalid_ack')
+    if (!ack.ok) return reply(409, typeof ack.code === 'string' && /^[a-z_]{1,64}$/.test(ack.code) ? ack.code : 'wake_failed')
+    if (!['server', 'lan_peer', 'already_online'].includes(ack.method)) return reply(502, 'invalid_ack')
+    return reply(200, '', ack.method)
+  } catch {
+    return reply(502, 'bridge_failed')
+  } finally {
+    if (directory) await rm(directory, { recursive: true, force: true }).catch(() => {})
+    wakeBusy = false
   }
 }
 
@@ -1122,6 +1228,9 @@ export function apply(ctx, config = {}) {
     }),
     'rabbitcontrol-client: report route',
   )
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact', path: '/rabbitcontrol-client/wake', handler: (req, res) => wakeHandler(ctx, req, res),
+  }), 'rabbitcontrol-client: wake route')
   ctx.effect(
     () => ctx.webServer.register({
       kind: 'exact',

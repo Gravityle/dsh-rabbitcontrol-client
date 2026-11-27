@@ -287,7 +287,7 @@ pub fn run_signaling_host(options: &SignalHostOptions) -> Result<(), String> {
         Some(pubkey),
         vec![options.lan_addr.clone()],
         options.wait,
-        true, // The local host toggle starts/stops this process.
+        signal::Registration::Host, // The local host toggle starts/stops this process.
     )?;
     let identity = identity::provision(&cfg, &options.token, &device_id, &options.cert_dir)?;
     eprintln!(
@@ -402,7 +402,10 @@ fn choose_host_transport(
         )
     };
 
-    if choice == crate::TransportChoice::Relay {
+    if incoming.is_relay_alloc && choice == crate::TransportChoice::P2p {
+        return Err("对端要求中继，本端要求 P2P".into());
+    }
+    if incoming.is_relay_alloc || choice == crate::TransportChoice::Relay {
         return to_relay("按要求只用中继");
     }
     let candidates = P2pCandidates {
@@ -410,7 +413,13 @@ fn choose_host_transport(
         peer_public_addr: incoming.peer_public_addr.clone(),
         peer_lan_addrs: incoming.peer_lan_addrs.clone(),
         local_udp_port: incoming.local_udp_port,
+        peer_public_addrs: incoming.peer_public_addrs.clone(),
+        self_nat_type: incoming.self_nat_type,
+        self_nat_port_delta: incoming.self_nat_port_delta,
+        peer_nat_type: incoming.peer_nat_type,
+        peer_nat_port_delta: incoming.peer_nat_port_delta,
     };
+    let candidates = p2p::filter_candidates(candidates, incoming.self_public_addr.as_deref());
     match p2p::punch_host(&candidates, mtls, &p2p::PunchBudget::default()) {
         Ok(transport) => Ok(transport),
         Err(error) if choice == crate::TransportChoice::P2p => {
