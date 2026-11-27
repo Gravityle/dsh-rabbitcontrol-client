@@ -18,6 +18,7 @@ mod input;
 mod p2p;
 mod relay;
 mod signal;
+mod sps;
 mod tee;
 
 use std::fs::File;
@@ -108,8 +109,8 @@ struct Args {
     /// 会话时长（`10s` / `5`）。
     #[arg(long, default_value = "10s")]
     duration: String,
-    /// 请求分辨率 WxH（实际以握手裁定值为准）。
-    #[arg(long, default_value = "1280x720")]
+    /// 请求分辨率 auto（被控端原生像素）或 WxH（宽高上限）。
+    #[arg(long, default_value = "auto")]
     resolution: String,
     /// 请求帧率。
     #[arg(long, default_value_t = 60)]
@@ -150,15 +151,18 @@ fn reanchorable_clock(origin: Instant) -> (SessionClock, Arc<Mutex<Instant>>) {
     (clock, anchor)
 }
 
-/// 解析 `WxH`。
+/// 线协议使用 0×0 请求被控端的当前像素尺寸。
 fn parse_resolution(text: &str) -> Result<Resolution, String> {
+    if text.trim().eq_ignore_ascii_case("auto") {
+        return Ok(Resolution::new(0, 0));
+    }
     let (w, h) = text
-        .split_once('x')
-        .ok_or_else(|| format!("无效的分辨率 {text:?}：应为 WxH"))?;
+        .split_once(['x', 'X'])
+        .ok_or_else(|| format!("无效的分辨率 {text:?}：应为 auto 或 WxH"))?;
     let width = w.trim().parse::<u32>().map_err(|_| format!("无效宽度 {w:?}"))?;
     let height = h.trim().parse::<u32>().map_err(|_| format!("无效高度 {h:?}"))?;
-    if width == 0 || height == 0 {
-        return Err("宽与高都必须大于 0".into());
+    if !(2..=16_384).contains(&width) || !(2..=16_384).contains(&height) {
+        return Err("宽与高必须在 2 至 16384 之间".into());
     }
     Ok(Resolution::new(width, height))
 }
@@ -278,7 +282,7 @@ fn run_session_once(args: &Args, connect: SocketAddr) -> Result<u64, String> {
 
     let pipeline = PipelineConfig {
         codec: rc_encode::Codec::H264,
-        resolution,
+        resolution: Resolution::new(2, 2), // 握手后由裁定值覆盖。
         fps: args.fps,
         bitrate_bps: DEFAULT_BITRATE_BPS,
         // 不解码、不呈现，任何硬件后端都不需要。
@@ -323,7 +327,7 @@ fn run_session_once(args: &Args, connect: SocketAddr) -> Result<u64, String> {
         Box::new(move |pcfg: &PipelineConfig| -> rc_types::Result<ControllerPipeline> {
             let decoder = TeeDecoder::new(SharedSink(Arc::clone(&sink)));
             let renderer = FakeRenderer::new(FakeRendererConfig {
-                size: (pcfg.resolution.width, pcfg.resolution.height),
+                size: (2, 2), // TeeDecoder 不产出像素。
                 ..FakeRendererConfig::default()
             })?;
             ControllerPipeline::with_backends(pcfg.clone(), Box::new(decoder), Box::new(renderer))

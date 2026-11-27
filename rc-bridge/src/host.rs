@@ -25,6 +25,44 @@ const TOOL_PERMISSIONS: rc_session::proto::ToolPermissions = rc_session::proto::
 
 use crate::clip::{fake_capture, split_access_units, unit_kind, AnchoredCapture, ClipEncoder};
 
+/// Clip bytes are passed through unchanged. Reject a Welcome that would mislabel them.
+fn clip_resolution(bytes: &[u8], requested: Resolution) -> Result<Resolution, String> {
+    let nals = crate::clip::nal_units(bytes);
+    let mut resolution = None;
+    for (i, &(_, header)) in nals.iter().enumerate() {
+        if bytes[header] & 31 != 7 { continue; }
+        let end = nals.get(i + 1).map_or(bytes.len(), |&(start, _)| start);
+        let (w, h) = crate::sps::sps_dimensions(&bytes[header..end]).ok_or("无效的片段 SPS")?;
+        let size = Resolution::new(w, h);
+        if w < 2 || h < 2 || size.to_even() != size || resolution.is_some_and(|prev| prev != size) {
+            return Err("片段需要固定的偶数像素尺寸".into());
+        }
+        resolution = Some(size);
+    }
+    let size = resolution.ok_or("片段缺少 H.264 SPS")?;
+    if requested.width != 0 && (requested.width < size.width || requested.height < size.height) {
+        return Err(format!("片段固有尺寸 {}x{} 超出请求上限", size.width, size.height));
+    }
+    Ok(size)
+}
+
+fn clip_pipeline(bytes: &[u8], size: Resolution, cfg: &PipelineConfig, start: Instant) -> rc_types::Result<HostPipeline> {
+    if cfg.resolution != size {
+        return Err(rc_types::Error::InvalidConfig(format!("片段固有尺寸 {}x{}，不支持缩放", size.width, size.height)));
+    }
+    let encoder = ClipEncoder::new(bytes, &rc_pipeline::default_encoder_config(cfg))?;
+    // The encoder only needs a paced event, never a screen-sized pixel buffer.
+    let capture = fake_capture(Resolution::new(2, 2), cfg.fps)?;
+    HostPipeline::with_backends_paced(cfg.clone(), Box::new(AnchoredCapture::new(capture, start)), Box::new(encoder), true)
+}
+
+fn display_cap(native: Resolution, request: Resolution) -> Resolution {
+    if request.width == 0 || (request.width >= native.width && request.height >= native.height) { return native; }
+    let scale = (f64::from(request.width) / f64::from(native.width)).min(f64::from(request.height) / f64::from(native.height));
+    let fit = |v: u32, limit: u32| (((f64::from(v) * scale / 2.0).round() as u32 * 2).min(limit & !1)).max(2);
+    Resolution::new(fit(native.width, request.width), fit(native.height, request.height))
+}
+
 /// 一次 clip host 的参数。
 pub struct ClipHostOptions {
     /// 监听地址（QUIC）。
@@ -47,6 +85,7 @@ pub struct ClipHostOptions {
 pub fn run(options: &ClipHostOptions) -> Result<(), String> {
     let bytes = std::fs::read(&options.clip)
         .map_err(|e| format!("无法读片段 {}: {e}", options.clip.display()))?;
+    let resolution = clip_resolution(&bytes, options.resolution)?;
     let units = split_access_units(&bytes);
     if units.is_empty() {
         return Err(format!("{} 里没有解析出访问单元", options.clip.display()));
@@ -61,14 +100,14 @@ pub fn run(options: &ClipHostOptions) -> Result<(), String> {
     eprintln!(
         "rc-bridge clip host：{} 个访问单元（关键帧 {keyframes}），{}x{} @ {}fps",
         units.len(),
-        options.resolution.width,
-        options.resolution.height,
+        resolution.width,
+        resolution.height,
         options.fps
     );
 
     let pipeline = PipelineConfig {
         codec: rc_encode::Codec::H264,
-        resolution: options.resolution,
+        resolution,
         fps: options.fps,
         bitrate_bps: options.bitrate_bps,
         // 真实屏幕才需要硬件后端；片段回放用假后端即可（也更省电）。
@@ -85,8 +124,8 @@ pub fn run(options: &ClipHostOptions) -> Result<(), String> {
         listen_addr: options.listen,
         mtu: rc_session::DEFAULT_SESSION_MTU,
         caps: SessionParams {
-            width: options.resolution.width,
-            height: options.resolution.height,
+            width: resolution.width,
+            height: resolution.height,
             fps: options.fps,
             bitrate_bps: options.bitrate_bps,
         },
@@ -108,27 +147,7 @@ pub fn run(options: &ClipHostOptions) -> Result<(), String> {
     };
 
     // 管线工厂：假采集（只按帧率触发）+ 直通编码器（交出片段里的真码流）。
-    let factory = {
-        let bytes = bytes.clone();
-        Box::new(move |pcfg: &PipelineConfig| -> rc_types::Result<HostPipeline> {
-            let encoder = ClipEncoder::new(
-                &bytes,
-                &EncoderConfig {
-                    resolution: pcfg.resolution,
-                    fps: pcfg.fps,
-                    bitrate_bps: pcfg.bitrate_bps,
-                    ..EncoderConfig::default()
-                },
-            )?;
-            let capture = fake_capture(pcfg.resolution, pcfg.fps)?;
-            HostPipeline::with_backends_paced(
-                pcfg.clone(),
-                Box::new(AnchoredCapture::new(capture, start)),
-                Box::new(encoder),
-                true,
-            )
-        })
-    };
+    let factory = Box::new(move |cfg: &PipelineConfig| clip_pipeline(&bytes, resolution, cfg, start));
 
     let mut host = HostSession::new(
         cfg,
@@ -233,7 +252,7 @@ pub fn run_signaling_host(options: &SignalHostOptions) -> Result<(), String> {
             if split_access_units(&bytes).is_empty() {
                 return Err(format!("{} 里没有解析出访问单元", options.clip.display()));
             }
-            Some(bytes)
+            Some(Arc::<[u8]>::from(bytes))
         }
         HostSource::Real => {
             register_real_backends()?;
@@ -245,8 +264,8 @@ pub fn run_signaling_host(options: &SignalHostOptions) -> Result<(), String> {
                 if real { "真实（CGEvent，可操作本机）" } else { "记录型（缺辅助功能权限，只能看不能操作）" }
             );
             eprintln!(
-                "rc-bridge 信令被控端：内容来源=真实屏幕（{}x{} @ {}fps）",
-                options.resolution.width, options.resolution.height, options.fps
+                "rc-bridge 信令被控端：内容来源=真实屏幕（{}fps，握手时读取主显示器像素）",
+                options.fps
             );
             None
         }
@@ -312,7 +331,7 @@ pub fn run_signaling_host(options: &SignalHostOptions) -> Result<(), String> {
                 continue;
             }
         };
-        match serve_over(options, bytes.as_deref(), transport, auth.clone()) {
+        match serve_over(options, bytes.clone(), transport, auth.clone()) {
             Ok(()) => {
                 served += 1;
                 eprintln!("rc-bridge 信令被控端：第 {served} 次会话结束，继续等下一个连接");
@@ -409,13 +428,22 @@ fn register_real_backends() -> Result<(), String> {
 
 fn serve_over(
     options: &SignalHostOptions,
-    bytes: Option<&[u8]>,
+    bytes: Option<Arc<[u8]>>,
     transport: Box<dyn rc_net::Transport>,
     auth: HostAuthConfig,
 ) -> Result<(), String> {
+    let resolution = match options.source {
+        HostSource::Clip => clip_resolution(bytes.as_deref().ok_or("缺少片段数据")?, options.resolution)?,
+        HostSource::Real => {
+            let native = rc_client_core::platform::main_display_backing_resolution().ok_or("读取主显示器物理像素失败")?;
+            let cap = display_cap(native, options.resolution);
+            eprintln!("rc-bridge 主显示器 {}x{} backing pixels，会话上限 {}x{}", native.width, native.height, cap.width, cap.height);
+            cap
+        }
+    };
     let pipeline = PipelineConfig {
         codec: rc_encode::Codec::H264,
-        resolution: options.resolution,
+        resolution,
         fps: options.fps,
         bitrate_bps: options.bitrate_bps,
         // 真实屏幕才需要硬件后端；片段回放用假后端即可（也更省电）。
@@ -432,8 +460,8 @@ fn serve_over(
         listen_addr: "127.0.0.1:0".parse().expect("占位地址"),
         mtu: rc_session::DEFAULT_SESSION_MTU,
         caps: SessionParams {
-            width: options.resolution.width,
-            height: options.resolution.height,
+            width: resolution.width,
+            height: resolution.height,
             fps: options.fps,
             bitrate_bps: options.bitrate_bps,
         },
@@ -459,41 +487,23 @@ fn serve_over(
         let start = start;
         Arc::new(move || u32::try_from(start.elapsed().as_micros()).unwrap_or(u32::MAX))
     };
-    let (capture, encoder, backend_label): (Box<dyn rc_capture::CaptureBackend>, Box<dyn rc_encode::Encoder>, String) =
-        match options.source {
-            HostSource::Clip => {
-                let bytes = bytes.ok_or("片段来源却没有片段数据")?;
-                let encoder = ClipEncoder::new(
-                    bytes,
-                    &EncoderConfig {
-                        resolution: options.resolution,
-                        fps: options.fps,
-                        bitrate_bps: options.bitrate_bps,
-                        ..EncoderConfig::default()
-                    },
-                )
-                .map_err(|e| format!("直通编码器构造失败：{e}"))?;
-                let capture = fake_capture(options.resolution, options.fps)
-                    .map_err(|e| format!("假采集构造失败：{e}"))?;
-                (capture, Box::new(encoder), "clip+fake".to_string())
-            }
-            HostSource::Real => {
-                let (capture, capture_label) = rc_pipeline::select_capture_labeled(&pipeline)
-                    .map_err(|e| format!("采集后端选择失败：{e}"))?;
-                let (encoder, encoder_label) = rc_pipeline::select_encoder_labeled(&pipeline)
-                    .map_err(|e| format!("编码后端选择失败：{e}"))?;
-                (capture, encoder, format!("{capture_label}+{encoder_label}"))
-            }
-        };
-    eprintln!("rc-bridge 信令被控端：后端={backend_label}");
-    let mut host = HostSession::with_parts(
-        cfg,
-        transport,
-        Box::new(AnchoredCapture::new(capture, start)),
-        encoder,
-        clock,
-    )
-    .map_err(|e| format!("被控端会话构造失败：{e}"))?;
+    // with_parts requires two backends even when a negotiated factory is installed.
+    // Its seed backends are never started, and are independent of the display size.
+    let seed = EncoderConfig { resolution: Resolution::new(2, 2), ..EncoderConfig::default() };
+    let mut host = HostSession::with_parts(cfg, transport,
+        fake_capture(seed.resolution, 1).map_err(|e| e.to_string())?,
+        Box::new(rc_encode::FakeEncoder::new(seed).map_err(|e| e.to_string())?), clock)
+        .map_err(|e| format!("被控端会话构造失败：{e}"))?;
+    host.set_preserve_caps_aspect(true);
+    host.set_pipeline_factory_for(Box::new(move |cfg| {
+        if let Some(bytes) = &bytes { return clip_pipeline(bytes, resolution, cfg, start); }
+        let (capture, cap_label) = rc_pipeline::select_capture_labeled(cfg)?;
+        if cap_label != "sck" { return Err(rc_types::Error::InvalidConfig("ScreenCaptureKit 采集不可用".into())); }
+        let (encoder, enc_label) = rc_pipeline::select_encoder_labeled(cfg)?;
+        if enc_label != "videotoolbox" { return Err(rc_types::Error::InvalidConfig("VideoToolbox 编码不可用".into())); }
+        eprintln!("rc-bridge 后端={cap_label}+{enc_label} {}x{} @ {}fps", cfg.resolution.width, cfg.resolution.height, cfg.fps);
+        HostPipeline::with_backends_paced(cfg.clone(), Box::new(AnchoredCapture::new(capture, start)), encoder, true)
+    }));
     let negotiated = host.handshake().map_err(|e| format!("握手失败：{e}"))?;
     eprintln!(
         "rc-bridge 信令被控端：已握手 {}x{} @ {}fps，开始发流",
@@ -508,4 +518,31 @@ fn serve_over(
         summary.captured, summary.frames_encoded, summary.datagrams_sent
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+
+    #[test]
+    fn auto_and_bounded_manual_requests() {
+        let native = Resolution::new(3024, 1964);
+        let auto = crate::parse_resolution("auto").unwrap();
+        assert_eq!(auto, Resolution::new(0, 0));
+        assert_eq!(display_cap(native, auto), native);
+        assert_eq!(display_cap(native, crate::parse_resolution("1280x720").unwrap()), Resolution::new(1108, 720));
+        assert_eq!(display_cap(native, Resolution::new(8000, 8000)), native);
+        for invalid in ["0x0", "1x500", "16385x4096", "x1080"] {
+            assert!(crate::parse_resolution(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn clip_uses_cropped_sps_and_rejects_undersized_request() {
+        // 640x368 coded picture with 8 cropped lines, from testsrc.h264.
+        let sps = [0,0,1,0x67,0x42,0xc0,0x1e,0xd9,0x00,0xa0,0x2f,0xf9,0x70,0x11,0,0,3,0,1,0,0,3,0,0x3c,0x8f,0x16,0x2e,0x48];
+        assert_eq!(clip_resolution(&sps, Resolution::new(0, 0)).unwrap(), Resolution::new(640, 360));
+        assert!(clip_resolution(&sps, Resolution::new(320, 240)).is_err());
+        assert!(clip_resolution(&sps[..6], Resolution::new(0, 0)).is_err());
+    }
 }

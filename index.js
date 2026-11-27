@@ -200,7 +200,14 @@ function normalizeClip(value) {
  */
 function bridgeArgs(query) {
   const mode = query.get('mode') ?? 'replay'
-  if (mode === 'signal') return { signal: true }
+  const resolution = query.get('resolution') ?? 'auto'
+  if (mode !== 'replay' && resolution !== 'auto') {
+    const match = /^([1-9]\d{0,4})x([1-9]\d{0,4})$/.exec(resolution)
+    if (!match || match.slice(1).some(n => Number(n) > 16384 || Number(n) % 2 !== 0)) {
+      return { error: '分辨率应为 auto 或偶数宽高，例如 1920x1080' }
+    }
+  }
+  if (mode === 'signal') return { signal: true, resolution }
   if (!ALLOWED_MODES.has(mode)) return { error: `不支持的 mode：${mode}` }
   const fpsRaw = Number.parseInt(query.get('fps') ?? '30', 10)
   const fps = Number.isFinite(fpsRaw) && fpsRaw >= 1 && fpsRaw <= 120 ? fpsRaw : 30
@@ -213,7 +220,7 @@ function bridgeArgs(query) {
   if (connect === undefined) return { error: '被控端地址必须形如 host:port' }
   const duration = query.get('duration') ?? '600s'
   if (!/^\d{1,5}(s|ms)?$/.test(duration)) return { error: '会话时长不合法' }
-  return { args: ['--connect', connect, '--fps', String(fps), '--duration', duration, '--out', '-'], acceptsInput: true, mode: 'connect' }
+  return { args: ['--connect', connect, '--resolution', resolution, '--fps', String(fps), '--duration', duration, '--out', '-'], acceptsInput: true, mode: 'connect' }
 }
 
 /**
@@ -224,7 +231,7 @@ function bridgeArgs(query) {
  * @param query - 查询参数（`device` 为 9 位设备码）。
  * @returns `{ args, env, acceptsInput }` 或 `{ error }`。
  */
-async function prepareSignalSession(ctx, query) {
+async function prepareSignalSession(ctx, query, resolution) {
   const device = (query.get('device') ?? '').replace(/\s+/g, '')
   if (!SIGNAL_DEVICE_ID.test(device)) return { error: '设备码必须是 9 位数字' }
   if (settings.server === '') return { error: '还没有配置 rc-server 地址：请在面板的「服务器」里填写地址并登录' }
@@ -249,7 +256,7 @@ async function prepareSignalSession(ctx, query) {
     args: ['--signal-target', device, '--signal-server', settings.server,
       '--signal-device-key', settings.signalDeviceKey, '--signal-ca', caPath,
       '--signal-cert-dir', SIGNAL_CERT_DIR, '--transport', settings.signalTransport, '--signal-connect',
-      '--fps', String(fps), '--duration', duration, '--out', '-'],
+      '--resolution', resolution, '--fps', String(fps), '--duration', duration, '--out', '-'],
     env: { ...process.env, RC_SIGNAL_TOKEN: token },
     acceptsInput: true,
   }
@@ -297,7 +304,9 @@ async function routeHandler(ctx, req, res) {
     res.end(`${BRIDGE_MISSING}${process.platform}-${process.arch}）`)
     return
   }
-  const plan = parsed.signal === true ? await prepareSignalSession(ctx, query) : parsed
+  const plan = parsed.signal === true ? await prepareSignalSession(ctx, query, parsed.resolution) : parsed
+  // 切换分辨率会中断旧请求；等待信令凭据期间对端可能已经断开。
+  if (res.destroyed) return
   if (plan.error !== undefined) {
     res.writeHead(409, { 'content-type': 'text/plain; charset=utf-8' })
     res.end(plan.error)
@@ -373,7 +382,7 @@ async function routeHandler(ctx, req, res) {
   })
   child.on('error', (error) => { finish(`spawn failed: ${error.message}`) })
   child.on('exit', (code, signal) => { finish(`bridge exit code=${String(code)} signal=${String(signal)}`) })
-  req.on('close', () => { finish('client closed') })
+  res.once('close', () => { finish('client closed') })
 }
 
 /**

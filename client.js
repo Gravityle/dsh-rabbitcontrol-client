@@ -20,6 +20,7 @@ window.__ModuleLoader__.load({
     let panelReady = false
     const ID = 'dsh-rabbitcontrol-client'
     const KIND = 'rabbitcontrol-client'
+    const RESOLUTIONS = ['auto', '3840x2160', '2560x1440', '1920x1080', '1600x900', '1280x720', '854x480']
     const STREAM = '/rabbitcontrol-client/stream'
     const INPUT = '/rabbitcontrol-client/input'
     const DEVICES = '/rabbitcontrol-client/devices'
@@ -61,7 +62,11 @@ window.__ModuleLoader__.load({
       decoded: '已解码',
       dropped: '丢弃',
       decodeErrors: '解码错误',
-      resolution: '分辨率',
+      resolution: '请求分辨率',
+      nativeResolution: '自动（被控端最高分辨率）',
+      decodedSize: '实际解码尺寸',
+      reconnectHint: '更改后将重新连接当前设备。',
+      reconnecting: '正在按新分辨率重连…',
       decoder: '解码器',
       waitingKey: '等待关键帧…',
       noWebCodecs: '当前浏览器不支持 WebCodecs（VideoDecoder），无法解码画面。',
@@ -154,7 +159,11 @@ window.__ModuleLoader__.load({
       decoded: 'Decoded',
       dropped: 'Dropped',
       decodeErrors: 'Decode errors',
-      resolution: 'Resolution',
+      resolution: 'Requested resolution',
+      nativeResolution: 'Auto (device maximum)',
+      decodedSize: 'Decoded size',
+      reconnectHint: 'Changing resolution reconnects to this device.',
+      reconnecting: 'Reconnecting at the new resolution…',
       decoder: 'Decoder',
       waitingKey: 'Waiting for a keyframe…',
       noWebCodecs: 'This browser has no WebCodecs (VideoDecoder); the picture cannot be decoded.',
@@ -231,7 +240,8 @@ window.__ModuleLoader__.load({
       '.rcc-head-text{display:flex;flex-direction:column;min-width:0}',
       '.rcc-title{font-size:14px;line-height:20px;font-weight:500;white-space:nowrap}',
       '.rcc-sub{font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-      '.rcc-head-actions{display:flex;align-items:center;gap:8px;margin-left:auto}',
+      '.rcc-head-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-left:auto;max-width:100%}',
+      '.rcc-resolution{display:flex;flex-wrap:wrap;align-items:center;gap:6px;max-width:100%}',
       '.rcc-dot{flex:none;width:8px;height:8px;border-radius:50%;background:var(--dsw-alias-state-idle-primary)}',
       '.rcc-dot-live{background:var(--dsw-alias-state-success-primary)}',
       '.rcc-dot-warn{background:var(--dsw-alias-state-warn-primary)}',
@@ -609,7 +619,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'rcc-row' },
           h('button', {
             className: running ? 'rcc-btn' : 'rcc-btn rcc-btn-primary', type: 'submit',
-          }, running ? t('disconnect') : (state.mode === 'connect' ? t('connect') : t('modeReplay')))),
+          }, running ? t('disconnect') : (state.mode === 'replay' ? t('modeReplay') : t('connect')))),
         state.mode === 'connect' && !running ? h('div', { className: 'rcc-hint' }, t('needHost')) : null,
         state.mode === 'signal' && !running ? h('div', { className: 'rcc-hint' }, t('relayHint')) : null)
     }
@@ -622,6 +632,8 @@ window.__ModuleLoader__.load({
     function Panel(props) {
       const t = props.t
       const [state, setState] = useState({ mode: 'connect', address: '127.0.0.1:9901', device: '', fps: 30, clip: '' })
+      const [resolution, setResolution] = useState('auto')
+      const activeTarget = useRef(null)
       const [running, setRunning] = useState(false)
       /** 当前连接目标（设备码），用于列表里高亮那一行。 */
       const [activeDevice, setActiveDevice] = useState('')
@@ -891,6 +903,8 @@ window.__ModuleLoader__.load({
         releaseModifiers()
         sessionRef.current = false
         ownerRef.current = null
+        activeTarget.current = null
+        setActiveDevice('')
         setRoute('')
         const current = abortRef.current
         abortRef.current = null
@@ -916,14 +930,15 @@ window.__ModuleLoader__.load({
 
       /** 画一帧到 canvas（尺寸变化时才改画布尺寸）。 */
       const draw = useCallback((frame) => {
-        const canvas = canvasRef.current
-        if (canvas === null) return
         const width = frame.displayWidth
         const height = frame.displayHeight
-        if (width > 0 && height > 0 && (canvas.width !== width || canvas.height !== height)) {
+        if (!(width > 0 && height > 0)) return
+        statsRef.current.size = `${width}×${height}`
+        const canvas = canvasRef.current
+        if (canvas === null) return
+        if (canvas.width !== width || canvas.height !== height) {
           canvas.width = width
           canvas.height = height
-          statsRef.current.size = `${String(width)}×${String(height)}`
         }
         const context = canvas.getContext('2d')
         if (context !== null) context.drawImage(frame, 0, 0)
@@ -968,12 +983,14 @@ window.__ModuleLoader__.load({
 
       /** 把一批事件 POST 给 Host。 */
       const postInput = useCallback(async (events) => {
+        const owner = ownerRef.current
         try {
           const response = await fetch(INPUT, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ events }),
           })
+          if (ownerRef.current !== owner) return
           if (response.status === 409) {
             setInputNotice(t('inputNone'))
             return
@@ -986,7 +1003,7 @@ window.__ModuleLoader__.load({
           setInputSent(inputSentRef.current)
           setInputNotice('')
         } catch (cause) {
-          setInputNotice(cause instanceof Error ? cause.message : String(cause))
+          if (ownerRef.current === owner) setInputNotice(cause instanceof Error ? cause.message : String(cause))
         }
       }, [t])
 
@@ -1133,19 +1150,23 @@ window.__ModuleLoader__.load({
             created = new window.VideoDecoder({
               output: (frame) => {
                 try {
+                  if (ownerRef.current !== owner) return
                   draw(frame)
+                  if (!statsRef.current.decoded) setNotice('')
                   statsRef.current.decoded += 1
                 } finally {
                   frame.close()
                 }
               },
               error: (cause) => {
+                if (ownerRef.current !== owner) return
                 statsRef.current.errors += 1
                 setError(`${t('decodeFailed')}: ${cause?.message ?? String(cause)}`)
               },
             })
             created.configure({ codec: chosen, avc: { format: 'annexb' }, optimizeForLatency: true })
           } catch (cause) {
+            try { created?.close() } catch { /* 已关闭 */ }
             // 下个关键帧可以重新尝试初始化。
             configuringRef.current = false
             statsRef.current.errors += 1
@@ -1166,7 +1187,7 @@ window.__ModuleLoader__.load({
         for (;;) {
           if (signal.aborted) { await reader.cancel().catch(() => {}); return }
           const { value, done } = await reader.read()
-          if (done) return
+          if (done || signal.aborted) return
           if (value === undefined) continue
           if (buffer.length + value.length > MAX_BUFFER_BYTES) {
             statsRef.current.errors += 1
@@ -1203,97 +1224,82 @@ window.__ModuleLoader__.load({
         }
       }, [feed])
 
-      const connect = useCallback(async (target) => {
-        // target：字符串 = 手填的直连地址；对象 = 设备行（可带地址链与设备码）或 { signalDevice }。
-        const chain = target !== null && typeof target === 'object' ? target : {}
-        const override = typeof target === 'string' && target !== ''
-          ? target
-          : (typeof chain.address === 'string' && chain.address !== '' ? chain.address : undefined)
-        const signalDevice = typeof chain.signalDevice === 'string' && chain.signalDevice !== ''
-          ? chain.signalDevice
-          : undefined
-        const chainAddresses = Array.isArray(chain.addresses)
-          ? chain.addresses.filter((item) => typeof item === 'string' && item !== '')
-          : []
-        const chainDeviceId = typeof chain.deviceId === 'string' && chain.deviceId !== '' ? chain.deviceId : undefined
-        const tried = Array.isArray(chain.tried) ? chain.tried : []
-        const usedAddress = (override ?? state.address).trim()
-        if (override !== undefined) {
-          setState((current) => ({ ...current, mode: 'connect', address: override }))
-        }
-        if (signalDevice !== undefined) {
-          setState((current) => ({ ...current, mode: 'signal', device: signalDevice }))
-        }
-        setError('')
-        statsRef.current = { received: 0, decoded: 0, dropped: 0, errors: 0, size: '' }
-        frameIndex.current = 0
-        publish()
+      const connect = useCallback(async (target = {}, requestedSize = resolution, message = '') => {
+        const mode = target.signalDevice ? 'signal' : target.address ? 'connect' : state.mode
+        const address = (target.address ?? state.address).trim()
+        const deviceId = mode === 'signal' ? (target.signalDevice ?? state.device).replace(/\s+/g, '') : target.deviceId
+        const addresses = target.addresses ?? []
+        const tried = [...(target.tried ?? []), address]
+        if (abortRef.current) teardown()
         const controller = new AbortController()
         abortRef.current = controller
         ownerRef.current = controller
-        sessionRef.current = true
-        setNotice('')
-        const activeMode = signalDevice !== undefined ? 'signal' : state.mode
-        const query = new URLSearchParams({ mode: activeMode, fps: String(state.fps) })
-        if (activeMode === 'replay') {
-          if (state.clip.trim() !== '') query.set('file', state.clip.trim())
-        } else if (activeMode === 'signal') {
-          query.set('device', (signalDevice ?? state.device).replace(/\s+/g, ''))
-          query.set('duration', '3600s')
-        } else {
-          query.set('connect', (override ?? state.address).trim())
-          query.set('duration', '3600s')
-        }
+        activeTarget.current = mode === 'signal' ? { signalDevice: deviceId } :
+          mode === 'connect' ? { address, deviceId, addresses, tried: target.tried } : null
+        sessionRef.current = mode !== 'replay'
+        setState((current) => ({ ...current, mode, address, ...(mode === 'signal' ? { device: deviceId } : {}) }))
         setRunning(true)
-        setActiveDevice(signalDevice ?? chainDeviceId ?? '')
+        setActiveDevice(deviceId ?? '')
+        setDecoderLabel('')
+        inputSentRef.current = 0
+        setInputSent(0)
+        setInputNotice('')
         setError('')
-        // 这次没成：先试同一台设备的其它公布地址，再降级中继；都用完才把错误显示出来。
-        const retryOrFail = (reasonText) => {
-          if (/device_disabled/.test(reasonText)) {
-            setError(reasonText)
-            return
-          }
-          const next = nextAttempt({
-            mode: activeMode,
-            address: usedAddress,
-            deviceId: chainDeviceId,
-            addresses: chainAddresses,
-            tried: [...tried, usedAddress],
-          })
-          if (next === null) {
-            setError(reasonText)
-            return
-          }
-          setNotice(next.viaRelay === true ? t('retryRelay') : t('retryAddress'))
-          void connect({ ...next, addresses: chainAddresses, deviceId: chainDeviceId, tried: [...tried, usedAddress] })
+        setNotice(message)
+        statsRef.current = { received: 0, decoded: 0, dropped: 0, errors: 0, size: '' }
+        frameIndex.current = 0
+        publish()
+        const canvas = canvasRef.current
+        if (canvas) canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height)
+        const query = new URLSearchParams({ mode, fps: String(state.fps) })
+        if (mode === 'replay') {
+          if (state.clip.trim()) query.set('file', state.clip.trim())
+        } else {
+          query.set('resolution', requestedSize)
+          query.set('duration', '3600s')
+          if (mode === 'signal') query.set('device', deviceId)
+          else query.set('connect', address)
         }
         try {
-          const response = await fetch(`${STREAM}?${query.toString()}`, { signal: controller.signal })
+          const response = await fetch(`${STREAM}?${query}`, { signal: controller.signal })
           if (!response.ok || response.body === null) {
-            if (response.status === 401) throw new Error('fence')
+            if (response.status === 401) throw new Error(FENCE_401)
             const text = await response.text().catch(() => '')
             let detail = text
             try {
               const parsed = JSON.parse(text)
-              detail = parsed.detail !== undefined && parsed.detail !== '' ? parsed.detail : (parsed.error ?? text)
+              detail = parsed.detail || parsed.error || text
             } catch { /* 非 JSON，直接用原文 */ }
-            throw new Error(`HTTP ${String(response.status)}${detail === '' ? '' : `：${detail.slice(0, 300)}`}`)
+            throw new Error(`HTTP ${response.status}${detail === '' ? '' : `：${String(detail).slice(0, 300)}`}`)
           }
           await pump(response, controller.signal)
-          if (!controller.signal.aborted) {
-            // 一个字节都没解出来，等同于失败——换下一个地址/中继再试。
-            if (statsRef.current.decoded === 0) retryOrFail(t('streamError'))
-            else setNotice(t('sessionEnded'))
-          }
+          if (controller.signal.aborted) return
+          if (!statsRef.current.decoded) throw new Error(t('streamError'))
+          setNotice(t('sessionEnded'))
         } catch (cause) {
           if (controller.signal.aborted) return
-          const message = cause instanceof Error ? cause.message : String(cause)
-          retryOrFail(message === 'fence' ? t('fenceError') : message)
+          const reason = cause instanceof Error ? cause.message : String(cause)
+          const next = reason === FENCE_401 || reason.includes('device_disabled') ? null : nextAttempt({ mode, deviceId, addresses, tried })
+          if (next) {
+            void connect({ ...next, deviceId, addresses, tried }, requestedSize, t(next.viaRelay ? 'retryRelay' : 'retryAddress'))
+          } else {
+            setNotice('')
+            setError(reason === FENCE_401 ? t('fenceError') : reason)
+          }
         } finally {
-          teardown(controller)
-          void loadDevices()
+          if (abortRef.current === controller) {
+            teardown(controller)
+            void loadDevices()
+          }
         }
-      }, [loadDevices, publish, pump, state.address, state.clip, state.device, state.fps, state.mode, t, teardown])
+      }, [loadDevices, publish, pump, resolution, state, t, teardown])
+
+      function changeResolution(event) {
+        const value = event.target.value
+        if (!RESOLUTIONS.includes(value)) return
+        setResolution(value)
+        if (activeTarget.current) void connect(activeTarget.current, value, t('reconnecting'))
+      }
 
       const children = [h(Styles, { key: 'styles' })]
       const stageText = running
@@ -1369,7 +1375,11 @@ window.__ModuleLoader__.load({
                 route === '' ? '' : (route === 'direct' ? t('routeDirect') : (route === 'p2p' ? t('routeP2P') : t('routeRelay'))),
               ].filter((part) => part !== '').join(' · ')))),
         h('div', { className: 'rcc-head-actions' },
-          metrics.decoded > 0 ? h('span', { className: 'rcc-chip', key: 'live' }, (metrics.size === '' ? '—' : metrics.size) + ' · ' + String(metrics.decoded)) : null,
+          (session.authorized || running) && state.mode !== 'replay' ? h('label', { className: 'rcc-resolution', title: t('reconnectHint') },
+            h('span', null, t('resolution')),
+            h('select', { className: 'rcc-select', value: resolution, onChange: changeResolution, 'aria-description': t('reconnectHint') },
+              RESOLUTIONS.map((size) => h('option', { key: size, value: size }, size === 'auto' ? t('nativeResolution') : size.replace('x', ' × '))))) : null,
+          running && metrics.size ? h('span', { className: 'rcc-chip', key: 'live' }, `${t('decodedSize')} ${metrics.size}`) : null,
           h('button', {
             className: 'rcc-icon-btn', type: 'button', title: t('refresh'), 'aria-label': t('refresh'),
             onClick: () => { void loadDevices() },
@@ -1508,7 +1518,7 @@ window.__ModuleLoader__.load({
             metric(t('decoded'), String(metrics.decoded)),
             metric(t('dropped'), String(metrics.dropped)),
             metric(t('decodeErrors'), String(metrics.errors)),
-            metric(t('resolution'), metrics.size === '' ? '—' : metrics.size),
+            metric(t('decodedSize'), metrics.size === '' ? '—' : metrics.size),
             metric(t('inputSent'), String(inputSent))),
           h('div', { className: 'rcc-host', key: 'host' },
             hostState.requiresWindowsGui && !hostState.enabled ? null : h('label', { className: 'rcc-check' },

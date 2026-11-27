@@ -336,7 +336,7 @@ pub fn run_signaling_client(
     let sink = crate::open_sink(out)?;
     let pipeline = PipelineConfig {
         codec: rc_encode::Codec::H264,
-        resolution,
+        resolution: rc_types::Resolution::new(2, 2), // 仅作握手前模板。
         fps,
         bitrate_bps: 8_000_000,
         prefer_hardware: false,
@@ -388,7 +388,7 @@ pub fn run_signaling_client(
         let (clock, _anchor) = crate::reanchorable_clock(t0);
         let decoder = TeeDecoder::new(crate::SharedSink(Arc::clone(&sink)));
         let renderer = FakeRenderer::new(FakeRendererConfig {
-            size: (resolution.width, resolution.height),
+            size: (2, 2), // TeeDecoder 不产出像素。
             ..FakeRendererConfig::default()
         })
         .map_err(|e| format!("假渲染器构造失败：{e}"))?;
