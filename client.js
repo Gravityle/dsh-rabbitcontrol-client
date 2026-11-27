@@ -70,7 +70,7 @@ window.__ModuleLoader__.load({
       inputSent: '已发事件',
       inputNone: '尚未连接会话，输入未发送。',
       inputDropped: '不支持的按键（未计入）',
-      focusHint: '点击画面获取键盘焦点',
+      focusHint: '点击画面操作远端，按 Shift+Esc 返回面板',
       needHost: '需要先在别处把被控端跑起来（例如 rc-cli host --listen 127.0.0.1:9901 --backend real）。',
       myDevices: '我的设备',
       refresh: '刷新',
@@ -81,14 +81,14 @@ window.__ModuleLoader__.load({
       busy: '正在连接',
       manual: '手动地址（直连）',
       advanced: '高级与手动',
-      connectHint: '点任意一台设备即可连接：有地址会先直连，失败自动改走中继；没有地址直接走中继。',
+      connectHint: '选择允许远控的在线设备：有地址会先直连，失败自动改走中继；没有地址直接走中继。',
       closeDrawer: '关闭',
+      controlDisabled: '对端已关闭远程控制',
       thisMachine: '本机',
       selfHint: '这就是当前这台电脑：不需要连接它（别的电脑会在各自列表里连它）。',
       fullscreen: '全屏画面',
       exitFullscreen: '退出全屏',
       fullscreenHint: '把画面铺满（隐藏列表与折叠区）；按 Esc 退出',
-      retryNewKey: '设备被停用，已换新 key 重试：',
       routeDirect: '直连',
       routeP2P: 'P2P 打洞',
       routeRelay: '中继',
@@ -102,7 +102,8 @@ window.__ModuleLoader__.load({
       hostStopped: '被控端未运行',
       hostDevice: '设备码',
       hostNeedLogin: '需要先登录 rc-server 才能作为被控端登记。',
-      hostHint: '打开后本机会登记到 rc-server 并公示屏幕；真实屏幕需要平台采集/编码后端（当前仅 macOS 支持，其它平台会给出可读报错）。',
+      windowsHostHint: 'Windows 随包边车可控制其他设备。要共享本机屏幕，请登录独立的 RabbitControl Windows GUI 并打开「本机被控」。该版本支持采集，键鼠注入尚未实现。',
+      hostHint: '打开后本机会登记到 rc-server 并公示屏幕；真实屏幕采集需要所选边车支持。',
       hostInjectReal: '输入注入=真实（CGEvent）：对端可以操作本机的鼠标键盘。',
       hostInjectBlocked: '输入注入被系统拦下：对端只能看、不能操作。请到「系统设置 → 隐私与安全性 → 辅助功能」勾选 DeepSeek Harness，然后完全退出并重开 DSH。',
       setupTitle: '连接 rc-server',
@@ -162,7 +163,7 @@ window.__ModuleLoader__.load({
       inputSent: 'Events sent',
       inputNone: 'No session yet; input was not sent.',
       inputDropped: 'Unsupported keys (not sent)',
-      focusHint: 'Click the picture to give it keyboard focus',
+      focusHint: 'Click the picture to control the remote device. Press Shift+Esc to return to the panel.',
       needHost: 'Start the controlled side first, e.g. rc-cli host --listen 127.0.0.1:9901 --backend real.',
       myDevices: 'My devices',
       refresh: 'Refresh',
@@ -173,14 +174,14 @@ window.__ModuleLoader__.load({
       busy: 'connecting',
       manual: 'Manual address (direct)',
       advanced: 'Advanced and manual',
-      connectHint: 'Click a device to connect: it tries a direct address first and falls back to the relay; devices without an address go straight to the relay.',
+      connectHint: 'Select an online device that allows remote control: it tries a direct address first and falls back to the relay; devices without an address go straight to the relay.',
       closeDrawer: 'Close',
+      controlDisabled: 'Remote control is disabled on this device',
       thisMachine: 'This machine',
       selfHint: 'This is the machine you are using: there is no need to connect to it (other machines connect to it from their own lists).',
       fullscreen: 'Full screen',
       exitFullscreen: 'Exit full screen',
       fullscreenHint: 'Fill the panel with the picture (hides the list and advanced section); press Esc to exit',
-      retryNewKey: 'Device was disabled; retrying with a new key:',
       routeDirect: 'direct',
       routeP2P: 'P2P',
       routeRelay: 'relay',
@@ -194,7 +195,8 @@ window.__ModuleLoader__.load({
       hostStopped: 'Controlled side is stopped',
       hostDevice: 'Device',
       hostNeedLogin: 'Sign in to rc-server before this machine can register as a controlled device.',
-      hostHint: 'When enabled this machine registers with rc-server and offers its screen. A real screen needs a platform capture/encode backend (macOS only for now; other platforms report a readable error).',
+      windowsHostHint: 'The bundled Windows bridge controls other devices. To share this screen, sign in to the separate RabbitControl Windows GUI and turn on “本机被控”. Its current source supports capture; keyboard and mouse injection are pending.',
+      hostHint: 'When enabled this machine registers with rc-server and offers its screen. Sharing a real screen requires capture support in the selected bridge.',
       hostInjectReal: 'Input injection is live (CGEvent): the peer can drive this machine.',
       hostInjectBlocked: 'Input injection is blocked by macOS: the peer can watch but not control. Grant Accessibility to DeepSeek Harness in System Settings → Privacy & Security → Accessibility, then fully quit and reopen DSH.',
       setupTitle: 'Connect to rc-server',
@@ -286,8 +288,8 @@ window.__ModuleLoader__.load({
       '.rcc-canvas{display:block;width:100%;height:100%;object-fit:contain;outline:none}',
       '.rcc-canvas:focus-visible{outline:var(--dsw-focus-ring-width,2px) solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:-2px}',
       '.rcc-placeholder{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;padding:24px;text-align:center;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}',
-      '.rcc-overlay{position:absolute;top:8px;right:8px;display:flex;gap:8px}',
-      '.rcc-overlay .rcc-chip{border-color:transparent;background:rgba(0,0,0,.55);color:#fff}',
+      '.rcc-overlay{position:absolute;top:8px;right:8px;left:8px;display:flex;justify-content:flex-end;flex-wrap:wrap;gap:4px;pointer-events:none}',
+      '.rcc-overlay .rcc-chip{white-space:normal;border-color:transparent;background:rgba(0,0,0,.55);color:#fff}',
       '.rcc-status{flex:none;display:flex;align-items:center;gap:8px;font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary)}',
       '.rcc-message{flex:none;margin:0;padding:8px 10px;border-radius:8px;font-size:13px;line-height:20px;word-break:break-word}',
       '.rcc-error{border:1px solid var(--dsw-alias-state-error-primary);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-state-error-primary)}',
@@ -330,7 +332,7 @@ window.__ModuleLoader__.load({
     function deviceRowState(device, hostDeviceId, running) {
       const deviceId = String(device?.deviceId ?? '')
       const isSelf = hostDeviceId !== '' && deviceId === hostDeviceId
-      const connectable = device?.online === true && running !== true && !isSelf
+      const connectable = device?.online === true && device.allowRemoteControl !== false && running !== true && !isSelf
       return { isSelf, connectable }
     }
 
@@ -440,6 +442,40 @@ window.__ModuleLoader__.load({
       return false
     }
 
+    // Some H.264 encoders deliver parameter sets before the first IDR.
+    function startupFrame(bytes, sets) {
+      let start = -1
+      let type = 0
+      let hasSps = false
+      let hasPps = false
+      function remember(end) {
+        if (start < 0 || end - start > 65536) return
+        if (type === 7) sets.sps = bytes.slice(start, end)
+        if (type === 8) sets.pps = bytes.slice(start, end)
+      }
+      for (let i = 0; i + 3 < bytes.length; i++) {
+        if (bytes[i] || bytes[i + 1] || bytes[i + 2] !== 1) continue
+        const prefix = i > 0 && bytes[i - 1] === 0 ? i - 1 : i
+        remember(prefix)
+        start = prefix
+        type = bytes[i + 3] & 31
+        hasSps ||= type === 7
+        hasPps ||= type === 8
+        i += 2
+      }
+      remember(bytes.length)
+      if (!hasIdr(bytes)) return null
+      if (hasSps && hasPps) return bytes
+      if (!sets.sps || !sets.pps) return null
+      const length = sets.sps.length + sets.pps.length + bytes.length
+      if (length > MAX_FRAME_BYTES) return null
+      const frame = new Uint8Array(length)
+      frame.set(sets.sps)
+      frame.set(sets.pps, sets.sps.length)
+      frame.set(bytes, sets.sps.length + sets.pps.length)
+      return frame
+    }
+
     /**
      * DOM `KeyboardEvent.code` → PS/2 Set 1 扫描码。
      *
@@ -493,18 +529,29 @@ window.__ModuleLoader__.load({
       return bits
     }
 
+    function isReleaseShortcut(event) {
+      return event.code === 'Escape' && event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey
+    }
+
     /**
      * 把画布内的指针位置归一化到 0..=65535。
      * @param canvas - 画布元素。
      * @param event - 指针事件。
      * @returns `{ x, y }`。
      */
-    function normalizePoint(canvas, event) {
+    function normalizePoint(canvas, event, clampOutside = false) {
       const rect = canvas.getBoundingClientRect()
-      const clamp = (value) => Math.max(0, Math.min(65535, Math.round(value)))
+      if (!rect.width || !rect.height || !canvas.width || !canvas.height) return null
+      const scale = Math.min(rect.width / canvas.width, rect.height / canvas.height)
+      const width = canvas.width * scale
+      const height = canvas.height * scale
+      const x = (event.clientX - rect.left - (rect.width - width) / 2) / width
+      const y = (event.clientY - rect.top - (rect.height - height) / 2) / height
+      if (!clampOutside && (x < 0 || x > 1 || y < 0 || y > 1)) return null
+      const clamp = (value) => Math.max(0, Math.min(65535, Math.round(value * 65535)))
       return {
-        x: clamp(((event.clientX - rect.left) / Math.max(1, rect.width)) * 65535),
-        y: clamp(((event.clientY - rect.top) / Math.max(1, rect.height)) * 65535),
+        x: clamp(x),
+        y: clamp(y),
       }
     }
 
@@ -587,7 +634,7 @@ window.__ModuleLoader__.load({
       const [devicesNote, setDevicesNote] = useState('')
       const [serverUrl, setServerUrl] = useState('')
       /** rc-server 会话：未配置地址或未登录时，主体显示设置卡片而不是设备列表。 */
-      const [session, setSession] = useState({ server: '', authorized: false, email: '', signalKey: '' })
+      const [session, setSession] = useState({ server: '', authorized: false, email: '' })
       /** 设置卡片里的输入与提示。 */
       const [setup, setSetup] = useState({ server: '', email: '', password: '', note: '', busy: false })
       /** 是否显示离线设备（默认只显示在线：中继会话结束时控制端会留下离线行）。 */
@@ -640,11 +687,9 @@ window.__ModuleLoader__.load({
       const ownerRef = useRef(null)
       const mountedRef = useRef(true)
       const statsRef = useRef({ received: 0, decoded: 0, dropped: 0, errors: 0, size: '' })
-      /** 因 device_disabled 换过几次 key（最多 3 次）。 */
-      const keyBumpRef = useRef(0)
       const frameIndex = useRef(0)
-      /** 解码器建立期间暂存的帧，建好后按序补送。 */
-      const pendingRef = useRef([])
+      /** 当前视频流的 H.264 参数集，断开时清空。 */
+      const parameterSets = useRef({})
       const configuringRef = useRef(false)
       const supported = typeof window !== 'undefined' && typeof window.VideoDecoder === 'function'
 
@@ -694,7 +739,6 @@ window.__ModuleLoader__.load({
             server: typeof payload.server === 'string' ? payload.server : '',
             authorized: payload.authorized === true,
             email: typeof payload.email === 'string' ? payload.email : '',
-            signalKey: typeof payload.signalKey === 'string' ? payload.signalKey : '',
           }
           setSession(next)
           setSetup((current) => ({ ...current, server: current.server === '' ? next.server : current.server }))
@@ -784,7 +828,10 @@ window.__ModuleLoader__.load({
           const response = await fetch(HOST, {
             method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled }),
           })
-          if (response.ok) setHostState(await response.json())
+          if (response.ok) {
+            const update = await response.json()
+            setHostState((current) => ({ ...current, ...update }))
+          }
           else setHostState((current) => ({ ...current, enabled: !enabled, error: `HTTP ${String(response.status)}` }))
         } catch (cause) {
           setHostState((current) => ({ ...current, enabled: !enabled, error: cause instanceof Error ? cause.message : String(cause) }))
@@ -848,7 +895,7 @@ window.__ModuleLoader__.load({
         const current = abortRef.current
         abortRef.current = null
         if (current !== null) current.abort()
-        pendingRef.current = []
+        parameterSets.current = {}
         configuringRef.current = false
         const decoder = decoderRef.current
         decoderRef.current = null
@@ -984,7 +1031,8 @@ window.__ModuleLoader__.load({
       const onPointerMove = useCallback((event) => {
         const canvas = canvasRef.current
         if (canvas === null || !sendRef.current) return
-        const point = normalizePoint(canvas, event)
+        const point = normalizePoint(canvas, event, canvas.hasPointerCapture(event.pointerId) && event.buttons !== 0)
+        if (point === null) return
         pushInput([{ t: 'mm', x: point.x, y: point.y }])
       }, [pushInput])
 
@@ -992,18 +1040,29 @@ window.__ModuleLoader__.load({
       const pointerButton = useCallback((event, pressed) => {
         const canvas = canvasRef.current
         if (canvas === null) return
+        const point = normalizePoint(canvas, event, !pressed && canvas.hasPointerCapture(event.pointerId))
+        if (point === null) return
         if (pressed) {
           canvas.focus()
           try { canvas.setPointerCapture(event.pointerId) } catch { /* 某些环境不支持 */ }
         }
         if (!sendRef.current) return
-        const point = normalizePoint(canvas, event)
         const button = event.button === 2 ? 1 : event.button === 1 ? 2 : 0
         pushInput([{ t: 'mm', x: point.x, y: point.y }, { t: 'mb', b: button, p: pressed }])
       }, [pushInput])
 
-      /** 键盘按下/抬起。 */
+      /** Shift+Escape 将焦点还给面板；其它按键继续转发。 */
       const onKey = useCallback((event, pressed) => {
+        if (isReleaseShortcut(event)) {
+          event.preventDefault()
+          event.stopPropagation()
+          if (pressed) {
+            releaseModifiers()
+            const exited = fill ? toggleFill() : Promise.resolve()
+            void exited.then(() => drawerTriggerRef.current?.focus())
+          }
+          return
+        }
         if (!sendRef.current) return
         const scancode = SCANCODES[event.code]
         if (scancode === undefined) {
@@ -1017,7 +1076,7 @@ window.__ModuleLoader__.load({
         event.preventDefault()
         pushInput([{ t: 'k', sc: scancode, p: pressed, mod: modifiers }])
         if (!pressed && MODIFIER_CODES.has(event.code)) modsRef.current.delete(event.code)
-      }, [pushInput])
+      }, [pushInput, releaseModifiers, fill, toggleFill])
 
       /** 滚轮：换算成「行」，正=向上/向右。 */
       const onWheelRef = useRef(null)
@@ -1052,17 +1111,16 @@ window.__ModuleLoader__.load({
           decodeChunk(decoder, payload)
           return
         }
-        // 没配置解码器之前只接受关键帧：它自带 SPS/PPS，能拼出 codec 字符串。
-        if (!hasIdr(payload)) {
+        const frame = startupFrame(payload, parameterSets.current)
+        if (frame === null) {
           statsRef.current.dropped += 1
           return
         }
-        const codec = codecFromAnnexB(payload)
+        const codec = codecFromAnnexB(frame)
         if (codec === undefined) {
           statsRef.current.dropped += 1
           return
         }
-        pendingRef.current.push(payload)
         if (configuringRef.current) return
         configuringRef.current = true
         const owner = ownerRef.current
@@ -1088,9 +1146,8 @@ window.__ModuleLoader__.load({
             })
             created.configure({ codec: chosen, avc: { format: 'annexb' }, optimizeForLatency: true })
           } catch (cause) {
-            // 建不起来就把门重新打开，别让 pending 无限堆积。
+            // 下个关键帧可以重新尝试初始化。
             configuringRef.current = false
-            pendingRef.current = []
             statsRef.current.errors += 1
             setError(`${t('decodeFailed')}: ${cause instanceof Error ? cause.message : String(cause)}`)
             return
@@ -1098,9 +1155,7 @@ window.__ModuleLoader__.load({
           decoderRef.current = created
           setDecoderLabel(chosen)
           configuringRef.current = false
-          const queue = pendingRef.current
-          pendingRef.current = []
-          for (const item of queue) decodeChunk(created, item)
+          decodeChunk(created, frame)
         })()
       }, [decodeChunk, draw, pickCodec, t])
 
@@ -1180,12 +1235,10 @@ window.__ModuleLoader__.load({
         setNotice('')
         const activeMode = signalDevice !== undefined ? 'signal' : state.mode
         const query = new URLSearchParams({ mode: activeMode, fps: String(state.fps) })
-        const viewerOverride = typeof chain.viewer === 'string' && chain.viewer !== '' ? chain.viewer : ''
         if (activeMode === 'replay') {
           if (state.clip.trim() !== '') query.set('file', state.clip.trim())
         } else if (activeMode === 'signal') {
           query.set('device', (signalDevice ?? state.device).replace(/\s+/g, ''))
-          if (viewerOverride !== '') query.set('viewer', viewerOverride)
           query.set('duration', '3600s')
         } else {
           query.set('connect', (override ?? state.address).trim())
@@ -1196,6 +1249,10 @@ window.__ModuleLoader__.load({
         setError('')
         // 这次没成：先试同一台设备的其它公布地址，再降级中继；都用完才把错误显示出来。
         const retryOrFail = (reasonText) => {
+          if (/device_disabled/.test(reasonText)) {
+            setError(reasonText)
+            return
+          }
           const next = nextAttempt({
             mode: activeMode,
             address: usedAddress,
@@ -1203,15 +1260,6 @@ window.__ModuleLoader__.load({
             addresses: chainAddresses,
             tried: [...tried, usedAddress],
           })
-          // 设备被管理端停用（key 永久不可复用）：自动换一个 key 再试，最多 3 次。
-          if (/device_disabled/.test(reasonText) && keyBumpRef.current < 3) {
-            keyBumpRef.current += 1
-            const base = session.signalKey !== '' ? session.signalKey : 'dsh-rabbitcontrol-viewer'
-            const viewer = `${base}-${keyBumpRef.current + 1}`
-            setNotice(`${t('retryNewKey')} ${viewer}`)
-            void connect({ ...target, viewer })
-            return
-          }
           if (next === null) {
             setError(reasonText)
             return
@@ -1245,7 +1293,7 @@ window.__ModuleLoader__.load({
           teardown(controller)
           void loadDevices()
         }
-      }, [loadDevices, publish, pump, session.signalKey, state.address, state.clip, state.device, state.fps, state.mode, t, teardown])
+      }, [loadDevices, publish, pump, state.address, state.clip, state.device, state.fps, state.mode, t, teardown])
 
       const children = [h(Styles, { key: 'styles' })]
       const stageText = running
@@ -1269,7 +1317,9 @@ window.__ModuleLoader__.load({
         const { isSelf, connectable } = deviceRowState(device, hostState.deviceId, running)
         const active = !isSelf && activeDevice === deviceId && deviceId !== ''
         const route = addresses.length > 0 ? t('routeDirectFirst') : t('routeRelayFirst')
-        const meta = [deviceId, device.os, addresses[0] ?? '', (!connectable ? (device.online !== true ? t('deviceOffline') : t('busy')) : route)]
+        const status = device.allowRemoteControl === false ? t('controlDisabled')
+          : device.online !== true ? t('deviceOffline') : running ? t('busy') : route
+        const meta = [deviceId, device.os, addresses[0] ?? '', connectable ? status : '']
           .filter((part) => typeof part === 'string' && part !== '').join(' · ')
         // 整行就是一个"连接"动作：有地址先直连、失败自动降级中继；没有地址直接走中继。
         const className = ['rcc-row', isSelf ? 'rcc-row-self' : '', active ? 'rcc-row-active' : '']
@@ -1281,10 +1331,10 @@ window.__ModuleLoader__.load({
           role: isSelf ? 'listitem' : 'button',
           tabIndex: connectable ? 0 : -1,
           'aria-disabled': connectable ? undefined : 'true',
-          'aria-label': isSelf ? `${t('thisMachine')} ${name}` : `${t('connect')} ${name}`,
+          'aria-label': isSelf ? `${t('thisMachine')} ${name}` : connectable ? `${t('connect')} ${name}` : `${name} · ${status}`,
           title: isSelf
             ? t('selfHint')
-            : (addresses.length > 0 ? addresses.join(' → ') : t('relayHint')),
+            : !connectable ? status : (addresses.length > 0 ? addresses.join(' → ') : t('relayHint')),
           onClick: isSelf ? undefined : () => { if (connectable) void connect(firstAttempt(device)) },
           onKeyDown: isSelf
             ? undefined
@@ -1301,7 +1351,8 @@ window.__ModuleLoader__.load({
           h('span', { className: 'rcc-row-title' },
             name,
             isSelf ? h('span', { className: 'rcc-self-chip', key: 'self' }, t('thisMachine')) : null),
-          h('span', { className: 'rcc-row-meta', title: meta }, meta)),
+          h('span', { className: 'rcc-row-meta', title: meta }, meta),
+          !isSelf && !connectable ? h('span', { className: 'rcc-hint' }, status) : null),
         h('span', { className: 'rcc-row-go' }, connectable ? '›' : ''))
       })
 
@@ -1405,6 +1456,8 @@ window.__ModuleLoader__.load({
                 width: 640,
                 height: 360,
                 tabIndex: 0,
+                'aria-label': t('focusHint'),
+                'aria-keyshortcuts': 'Shift+Escape',
                 onPointerMove: (event) => { onPointerMove(event) },
                 onPointerDown: (event) => { pointerButton(event, true) },
                 onPointerUp: (event) => { pointerButton(event, false) },
@@ -1413,7 +1466,8 @@ window.__ModuleLoader__.load({
                 onBlur: () => { releaseModifiers() },
               }),
               running
-                ? h('div', { className: 'rcc-overlay' }, h('span', { className: 'rcc-chip', key: 'state' }, stageText))
+                ? h('div', { className: 'rcc-overlay' }, h('span', { className: 'rcc-chip', key: 'state' }, stageText),
+                    sendInputEnabled ? h('span', { className: 'rcc-chip' }, t('focusHint')) : null)
                 : null)
             : h('p', { className: 'rcc-message rcc-error' }, t('noWebCodecs'))),
           h('div', { className: 'rcc-status', role: 'status' },
@@ -1457,7 +1511,7 @@ window.__ModuleLoader__.load({
             metric(t('resolution'), metrics.size === '' ? '—' : metrics.size),
             metric(t('inputSent'), String(inputSent))),
           h('div', { className: 'rcc-host', key: 'host' },
-            h('label', { className: 'rcc-check' },
+            hostState.requiresWindowsGui && !hostState.enabled ? null : h('label', { className: 'rcc-check' },
               h('input', {
                 type: 'checkbox', checked: hostState.enabled === true,
                 disabled: !session.authorized,
@@ -1476,7 +1530,7 @@ window.__ModuleLoader__.load({
                 onChange: (event) => { setShowOffline(event.target.checked) },
               }),
               h('span', null, t('showOffline'))),
-          h('p', { className: 'rcc-hint' }, t('hostHint')),
+          h('p', { className: 'rcc-hint' }, t(hostState.requiresWindowsGui ? 'windowsHostHint' : 'hostHint')),
             (() => {
               const log = Array.isArray(hostState.log) ? hostState.log.join('\n') : ''
               if (/输入注入=真实/.test(log)) return h('p', { className: 'rcc-hint' }, t('hostInjectReal'))
@@ -1510,7 +1564,7 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'layout', 'locale', 'sidebarRight', 'sidebarRightTabs', 'shortcuts'],
       // 只给无头测试用：把纯映射函数暴露出来，好在没有浏览器时也能验证扫描码表。
-      __test: { SCANCODES, modifierBits, MAX_FRAME_BYTES, MAX_BUFFER_BYTES, INPUT, nextAttempt, firstAttempt, deviceRowState, css: CSS },
+      __test: { startupFrame, normalizePoint, isReleaseShortcut, SCANCODES, modifierBits, MAX_FRAME_BYTES, MAX_BUFFER_BYTES, INPUT, nextAttempt, firstAttempt, deviceRowState, css: CSS },
       apply(ctx) {
         guard('locale', () => {
           ctx.effect(() => ctx.locale.register(NS, { zh: ZH, en: EN }), 'rabbitcontrol-client: copy')

@@ -2,7 +2,7 @@
 #   bridgePath   rc-bridge 可执行文件路径
 #   clipPath     「回放测试片段」用的 Annex-B H.264 文件
 #   serverUrl    rc-server 的 REST 地址（设备列表从这里读；与「服务器状态」面板同一个部署）
-#   signalDeviceKey 信令路径用的设备 key（被停用后需更换）
+#   signalDeviceKey 信令路径用的设备 key
 #   insecureTls  接受自签证书；只对本机/内网自签部署打开
 - insert:
     - id: rabbitcontrol-client
@@ -12,6 +12,6 @@
         clipPath: ''   # 留空：回放模式需要时在面板里指定本机文件
         serverUrl: ''   # 留空 = 由使用者第一次在面板里填（并写回本 profile）
         # 本机在 rc-server 上的信令设备 key。注意：设备一旦被管理端停用（DELETE），
-        # 这个 key 就登记不上了，需要在这里换一个新的。
+        # 客户端将停止重试，由管理员处理停用状态。
         signalDeviceKey: 'dsh-rabbitcontrol-viewer'
         insecureTls: true

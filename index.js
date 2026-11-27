@@ -10,7 +10,7 @@
 import z from '@deepseek-ai/schemastery'
 import { appendFileSync, existsSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import { request as httpRequest } from 'node:http'
@@ -53,7 +53,7 @@ const SIGNAL_CERT_DIR = join(TMP, 'dsh-rabbitcontrol-certs')
 /**
  * 本端信令设备 key 的默认值。同一 profile 固定即可，但**一旦该设备被管理端停用**
  * （`DELETE /api/v1/devices/{id}` 是停用而非删除），这个 key 就再也登记不上
- * （服务端回 `device_disabled`）——那时在插件配置里换一个 `signalDeviceKey`。
+ * （服务端回 `device_disabled`），需要管理员处理。
  */
 const SIGNAL_DEVICE_KEY = 'dsh-rabbitcontrol-client'
 /** 报错落盘位置。 */
@@ -64,26 +64,15 @@ const INPUT_PATH = '/rabbitcontrol-client/input'
 const INPUT_KIND = 10
 /** 输入请求体上限。 */
 const MAX_INPUT_BODY = 64 * 1024
-/** 边车默认路径（可在插件行 config 覆盖）。 */
-/** 开发机上的边车（源码构建产物）。 */
-const DEV_BRIDGE = ''   // 开发期可显式设 bridgePath；发布包不写死任何绝对路径
-/** 本插件自己的目录（ESM 下由模块地址推出来）。 */
 const BUNDLE_DIR = dirname(fileURLToPath(import.meta.url))
-/**
- * 插件自带的边车：**按平台选**。Windows 用 `bin/rc-bridge-win-x64.exe`，
- * 其它平台用 `bin/rc-bridge`。带上它，别的机器装插件就**不需要编译、不需要配路径**。
- */
-const BUNDLED_BRIDGE = join(BUNDLE_DIR, 'bin', process.platform === 'win32' ? 'rc-bridge-win-x64.exe' : 'rc-bridge')
-/**
- * 未显式配置 `bridgePath` 时用哪个边车：优先插件自带的，其次开发机路径。
- * @returns 可执行文件路径。
- */
+
 function defaultBridge() {
-  if (existsSync(BUNDLED_BRIDGE)) return BUNDLED_BRIDGE
-  // 开发机上的源码构建产物只在本机存在；别让别的机器（Intel Mac / Linux 等
-  // 没有自带边车的平台）拿到一个指向别人机器的路径——那样报错会莫名其妙。
-  if (existsSync(DEV_BRIDGE)) return DEV_BRIDGE
-  return ''
+  let name
+  if (process.platform === 'darwin' && process.arch === 'arm64') name = 'rc-bridge'
+  else if (process.platform === 'win32' && ['x64', 'arm64'].includes(process.arch)) name = 'rc-bridge-win-x64.exe'
+  else return ''
+  const path = join(BUNDLE_DIR, 'bin', name)
+  return existsSync(path) ? path : ''
 }
 /** 离线回放默认片段（可在插件行 config 覆盖）。 */
 const DEFAULT_CLIP = ''   // 回放用的片段由使用者在自己机器上指定（发布包不带绝对路径）
@@ -113,7 +102,7 @@ export const Config = z.object({
   bridgePath: z.string().default('').description('rc-bridge 可执行文件路径；留空则用插件自带的（bin/ 下按平台选）'),
   clipPath: z.string().default(DEFAULT_CLIP).description('「回放测试片段」用的 Annex-B H.264 文件'),
   serverUrl: z.string().default('').description('rc-server 的 REST 地址；留空时在面板里首次配置（推荐）'),
-  signalDeviceKey: z.string().default(SIGNAL_DEVICE_KEY).description('本机在 rc-server 上的信令设备 key（设备被管理端停用后需要换一个）'),
+  signalDeviceKey: z.string().default(SIGNAL_DEVICE_KEY).description('本机在 rc-server 上的信令设备 key（停用后请联系管理员）'),
   signalTransport: z.union(['auto', 'p2p', 'relay']).default('auto').description('信令路径的传输偏好：auto = 先打洞（RCP2）失败回退中继（RCR1）；p2p = 只用打洞；relay = 只用中继'),
   insecureTls: z.boolean().default(true).description('接受自签证书；仅对本机/内网自签部署打开'),
   hostMode: z.boolean().default(false).description('作为被控端：本机登记到 rc-server 并把屏幕提供给别人看（需要平台采集/编码后端，当前仅 macOS 支持真实屏幕）'),
@@ -235,19 +224,6 @@ function bridgeArgs(query) {
  * @param query - 查询参数（`device` 为 9 位设备码）。
  * @returns `{ args, env, acceptsInput }` 或 `{ error }`。
  */
-/**
- * 本次信令会话用的客户端 key。
- *
- * 面板在遇到 `device_disabled`（设备被管理端停用，key 永久不可复用）时会带上
- * `viewer=<key>-2/-3` 重试，所以这里允许覆盖，但只接受合法形状。
- * @param query - 查询参数。
- * @returns 可用的设备 key。
- */
-function signalKeyFor(query) {
-  const viewer = (query.get('viewer') ?? '').trim()
-  return /^[A-Za-z0-9._-]{1,64}$/.test(viewer) ? viewer : settings.signalDeviceKey
-}
-
 async function prepareSignalSession(ctx, query) {
   const device = (query.get('device') ?? '').replace(/\s+/g, '')
   if (!SIGNAL_DEVICE_ID.test(device)) return { error: '设备码必须是 9 位数字' }
@@ -271,7 +247,7 @@ async function prepareSignalSession(ctx, query) {
   if (!/^\d{1,5}(s|ms)?$/.test(duration)) return { error: '会话时长不合法' }
   return {
     args: ['--signal-target', device, '--signal-server', settings.server,
-      '--signal-device-key', signalKeyFor(query), '--signal-ca', caPath,
+      '--signal-device-key', settings.signalDeviceKey, '--signal-ca', caPath,
       '--signal-cert-dir', SIGNAL_CERT_DIR, '--transport', settings.signalTransport, '--signal-connect',
       '--fps', String(fps), '--duration', duration, '--out', '-'],
     env: { ...process.env, RC_SIGNAL_TOKEN: token },
@@ -506,7 +482,7 @@ async function startHost(ctx) {
   host = { child, deviceId: '', backend: '', error: '', restarts: host.restarts + 1, log: [] }
   const remember = (line) => {
     host.log = [...host.log, line].slice(-20)
-    if (host.error === '' && /错误|error/i.test(line)) host.error = line.slice(0, 300)
+    if (/被控端错误：|error=Some\(/.test(line)) host.error = line.slice(0, 300)
   }
   const consume = (chunk) => {
     for (const line of String(chunk).split('\n')) {
@@ -553,6 +529,8 @@ async function hostHandler(ctx, req, res) {
       error: host.error,
       source: settings.hostSource,
       platform: `${process.platform}-${process.arch}`,
+      requiresWindowsGui: process.platform === 'win32' && settings.hostSource === 'real'
+        && (settings.bridge === '' || resolve(settings.bridge).toLowerCase() === join(BUNDLE_DIR, 'bin', 'rc-bridge-win-x64.exe').toLowerCase()),
       log: host.log.slice(-8),
     }))
     return
@@ -875,7 +853,7 @@ async function accessToken(ctx) {
  * 设备列表处理器。
  *
  * 列表来自 rc-server；每个设备带上它登记时公布的 `lan_addrs`——面板据此做局域网直连。
- * 跨网段所需的信令打洞与中继尚未实现，这里如实只报"有没有可用地址"。
+ * 向面板提供设备地址与被控权限。
  * @param ctx - Host 上下文。
  * @param req - Node 请求。
  * @param res - Node 响应。
@@ -921,7 +899,8 @@ async function devicesHandler(ctx, req, res) {
     }
     const rows = Array.isArray(result.json?.devices) ? result.json.devices : []
     // 被管理端禁用的设备不列出来：它们连不上，列着只会让人点空。
-    const usable = rows.filter((row) => row?.disabled !== true)
+    const usable = rows.filter((row) => row && row.disabled !== true)
+    usable.sort((a, b) => Number(b.online === true) - Number(a.online === true))
     reply({
       authorized: true,
       server: settings.server,
@@ -932,6 +911,7 @@ async function devicesHandler(ctx, req, res) {
         os: row?.os ?? '',
         online: row?.online === true,
         inSession: row?.in_session === true,
+        allowRemoteControl: row?.allow_remote_control ?? !/android|ios/i.test(row?.os ?? ''),
         lanAddrs: Array.isArray(row?.lan_addrs) ? row.lan_addrs.filter((item) => typeof item === 'string') : [],
       })),
     })
