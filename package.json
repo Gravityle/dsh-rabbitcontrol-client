@@ -1,6 +1,6 @@
 {
   "name": "dsh-rabbitcontrol-client",
-  "version": "0.12.1",
+  "version": "0.12.2",
   "type": "module",
   "description": "RabbitControl remote desktop and controlled side for DeepSeek Harness: sign in to your own rc-server, view or drive another device from the left-sidebar panel, and optionally offer this machine's own screen (macOS) to others.",
   "exports": {

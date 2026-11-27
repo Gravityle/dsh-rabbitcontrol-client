@@ -333,6 +333,7 @@ window.__ModuleLoader__.load({
       '.rcc-label{flex:0 0 84px;font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary)}',
       '.rcc-input,.rcc-select{flex:1 1 auto;min-width:0;box-sizing:border-box;height:28px;padding:0 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px}',
       '@media (pointer:coarse){.rcc-input,.rcc-select{height:34px;font-size:16px}}',
+      '.rcc-pane-title{flex-shrink:0}.rcc-pane-head .rcc-offline-filter{margin-inline-start:auto;gap:4px;font-size:12px;line-height:16px;cursor:pointer}',
       '.rcc-check{display:flex;align-items:center;gap:8px;font-size:13px;line-height:20px}',
       '.rcc-hint{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}',
       '.rcc-fill .rcc-list-pane,.rcc-fill .rcc-pane-hint{display:none}',
@@ -1491,12 +1492,13 @@ window.__ModuleLoader__.load({
           h('div', { className: 'rcc-pane-head' },
             h('span', { className: 'rcc-pane-title' }, t('myDevices')),
             h('span', { className: 'rcc-count' }, String(visibleDevices.length)),
-            h('span', { className: 'rcc-spacer' })),
+            h('label', { className: 'rcc-check rcc-offline-filter' },
+              h('input', { type: 'checkbox', checked: showOffline, onChange: event => setShowOffline(event.target.checked) }),
+              h('span', null, t('showOffline') + (hiddenCount ? ` (${hiddenCount})` : '')))),
           h('p', { className: 'rcc-hint rcc-pane-hint' }, t('connectHint')),
           devices.length === 0
             ? h('p', { className: 'rcc-empty' }, devicesNote === '' ? t('noDevices') : devicesNote)
             : h('ul', { className: 'rcc-rows' }, deviceRows),
-          hiddenCount > 0 ? h('button', { type: 'button', className: 'rcc-btn', onClick: () => setShowOffline(true) }, `${t('showOffline')} (${hiddenCount})`) : null,
           wake.note ? h('p', { className: 'rcc-empty', role: 'status' }, wake.note) : null,
           devices.length > 0 && devicesNote !== '' ? h('p', { className: 'rcc-empty' }, devicesNote) : null),
         h('section', { className: 'rcc-stage-pane' },
@@ -1589,12 +1591,6 @@ window.__ModuleLoader__.load({
               hostState.deviceId === '' ? null : h('span', null, `· ${t('hostDevice')} ${hostState.deviceId}`),
               hostState.backend === '' ? null : h('span', null, `· ${hostState.backend}`)),
             hostState.enabled !== true || session.authorized ? null : h('p', { className: 'rcc-hint' }, t('hostNeedLogin')),
-              h('label', { className: 'rcc-check' },
-              h('input', {
-                type: 'checkbox', checked: showOffline,
-                onChange: (event) => { setShowOffline(event.target.checked) },
-              }),
-              h('span', null, t('showOffline'))),
           h('p', { className: 'rcc-hint' }, t(hostState.requiresWindowsGui ? 'windowsHostHint' : 'hostHint')),
             (() => {
               const log = Array.isArray(hostState.log) ? hostState.log.join('\n') : ''

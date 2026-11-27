@@ -7,7 +7,7 @@
 在 DeepSeek Harness 中把下面这句话发给助手，即可安装固定版本：
 
 ```text
-请用 plugin_manager 的 install_bundle 安装 https://github.com/Gravityle/dsh-rabbitcontrol-client/releases/download/v0.12.1/dsh-rabbitcontrol-client-0.12.1.tgz
+请用 plugin_manager 的 install_bundle 安装 https://github.com/Gravityle/dsh-rabbitcontrol-client/releases/download/v0.12.2/dsh-rabbitcontrol-client-0.12.2.tgz
 ```
 
 安装后打开左侧「远程桌面」，填写自己的 rc-server 地址并登录。包内附带 Apple Silicon Mac 和 Windows x64 边车，这两种平台可将 `bridgePath` 留空。
@@ -31,7 +31,7 @@
 2. 登录后点「我的设备」中的在线设备。插件按设备码发起信令连接，自动模式会尝试局域网或公网 P2P，打洞失败后回退到中继。使用独立监听的直连服务时，可在「高级与手动」中填写地址。
 3. 在线设备排在前面。对端关闭「允许远程控制」时，该行显示原因并禁用连接；旧服务端省略权限时沿用 Core 的平台默认值。
 4. 首次连接使用被控端可提供的最高分辨率。面板顶部显示实测 FPS，旁边的切换框显示当前解码宽高。选其他尺寸会短暂重连同一设备。点击画面右下角的全屏图标进入全屏，再点一次或按 Esc 退出。
-5. 需要开机时打开「显示离线设备」。对于同账号下已启用 Wake-on-LAN、且服务端报告支持唤醒的离线设备，可手动发送唤醒请求。设备所在局域网需要可用的在线代理。请求结果以服务端回执为准，设备重新显示在线后即可连接。
+5. 需要开机时勾选「我的设备」标题右侧的「显示离线设备」。对于同账号下已启用 Wake-on-LAN、且服务端报告支持唤醒的离线设备，可手动发送唤醒请求。设备所在局域网需要可用的在线代理。请求结果以服务端回执为准，设备重新显示在线后即可连接。
 6. 点齿轮打开「高级与手动」抽屉，可查看帧率、设置手动地址和键鼠输入，或回放本地 H.264 片段。
 
 ## 配置
